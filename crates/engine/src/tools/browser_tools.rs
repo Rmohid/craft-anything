@@ -174,6 +174,17 @@ pub fn specs() -> Vec<ToolSpec> {
             schema_of::<CaptureAudioParams>,
             web_audio_capture,
         ),
+        spec(
+            "web_audio_offline_render",
+            "Render an audio recipe offline",
+            "Rebuild an audio scene from a versioned recipe (oscillator layers with an optional filter, gain and pan; at most 256 layers) in a headless OfflineAudioContext, then fingerprint what it rendered: 48 log-spaced spectrum bins, a 1 Hz loudness envelope and the recipe's graph signature, plus the rendered length. Launches or attaches to a Chromium over CDP and injects the recipe, so it needs your approval and Deep mode. The fingerprint goes straight into web_audio_compare as the rebuilt side.",
+            "Rebuild a sound recipe in a private headless browser and measure how close it comes to the original.",
+            Toolset::Browser,
+            Effects::EVIDENCE.union(Effects::EXECUTES_FOREIGN_CODE).union(Effects::ACCESSES_NETWORK).union(Effects::LAUNCHES_PROCESS),
+            Requires::Nothing,
+            schema_of::<OfflineRenderParams>,
+            web_audio_offline_render,
+        ),
     ]
 }
 
@@ -2569,6 +2580,623 @@ fn clip_text(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max).collect();
     out.push('…');
     out
+}
+
+// ---------------------------------------------------------------------------------------------
+// web_audio_offline_render (Deep-only: renders a recipe in a headless OfflineAudioContext)
+
+/// The recipe format this build renders.
+const OFFLINE_RECIPE_VERSION: u32 = 1;
+/// Most layers one offline render accepts.
+const MAX_OFFLINE_LAYERS: usize = 256;
+/// Largest offline render, in frames: two channels of 32-bit floats stay around 64 MB.
+const MAX_OFFLINE_FRAMES: u64 = 8_000_000;
+/// Most spectrum values an offline render keeps (an 8192-point FFT has 4096 bins).
+const MAX_OFFLINE_SPECTRUM: usize = 4_096;
+/// Most loudness values an offline render keeps (ten minutes at one per second).
+const MAX_OFFLINE_RMS: usize = 600;
+/// Oscillator waveforms an offline recipe may ask for.
+const OFFLINE_WAVES: &[&str] = &["sine", "square", "sawtooth", "triangle"];
+/// Biquad filter kinds an offline recipe may ask for.
+const OFFLINE_FILTERS: &[&str] = &["lowpass", "highpass", "bandpass", "notch", "peaking", "lowshelf", "highshelf"];
+
+/// The audio scene to rebuild: a version, the scenario it stands for, and its layers.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineRecipe {
+    /// Format version; this build renders version 1.
+    #[serde(default = "d_recipe_version")]
+    pub version: u32,
+    /// The scenario this recipe rebuilds, e.g. "focus"; it becomes the fingerprint's scenario.
+    #[serde(default)]
+    pub scenario_id: Option<String>,
+    /// The layers to render, in order; at most 256.
+    #[serde(default)]
+    pub layers: Vec<OfflineLayer>,
+}
+
+/// One oscillator layer: a waveform, an optional filter, then gain and pan.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineLayer {
+    /// Your name for the layer, kept in the mixer state (default `layer_<index>`).
+    #[serde(default)]
+    pub id: Option<String>,
+    /// The layer kind; this build renders `oscillator`.
+    #[serde(default = "d_layer_kind")]
+    pub kind: String,
+    /// Oscillator waveform: sine, square, sawtooth or triangle.
+    #[serde(default = "d_layer_wave")]
+    pub wave: String,
+    /// Oscillator frequency in Hz (20..=20000; default 220).
+    #[serde(default = "d_layer_frequency")]
+    pub frequency: f64,
+    /// Layer gain (0..=2; default 0.5).
+    #[serde(default = "d_layer_gain")]
+    pub gain: f64,
+    /// Stereo position (-1..=1; default 0, which adds no panner node).
+    #[serde(default)]
+    pub pan: f64,
+    /// An optional biquad filter placed before the gain.
+    #[serde(default)]
+    pub filter: Option<OfflineFilter>,
+}
+
+/// A biquad filter in an offline recipe.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineFilter {
+    /// Filter kind: lowpass, highpass, bandpass, notch, peaking, lowshelf or highshelf.
+    #[serde(default = "d_filter_kind")]
+    pub kind: String,
+    /// Cutoff or centre frequency in Hz (20..=20000; default 1000).
+    #[serde(default = "d_filter_frequency")]
+    pub frequency: f64,
+    /// Filter Q (0.0001..=1000; default 0.707).
+    #[serde(default = "d_filter_q")]
+    pub q: f64,
+}
+
+fn d_recipe_version() -> u32 {
+    OFFLINE_RECIPE_VERSION
+}
+
+fn d_layer_kind() -> String {
+    "oscillator".into()
+}
+
+fn d_layer_wave() -> String {
+    "sine".into()
+}
+
+fn d_layer_frequency() -> f64 {
+    220.0
+}
+
+fn d_layer_gain() -> f64 {
+    0.5
+}
+
+fn d_filter_kind() -> String {
+    "lowpass".into()
+}
+
+fn d_filter_frequency() -> f64 {
+    1_000.0
+}
+
+fn d_filter_q() -> f64 {
+    0.707
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineRenderParams {
+    /// Loopback CDP endpoint, e.g. http://127.0.0.1:9222. Omit to launch a browser.
+    #[serde(default)]
+    pub cdp_endpoint: Option<String>,
+    /// Launch a located Chromium when no endpoint is given.
+    #[serde(default)]
+    pub launch: bool,
+    /// Launch headless (when launching).
+    #[serde(default = "yes")]
+    pub headless: bool,
+    /// Pass --no-sandbox when launching (needed in some containers).
+    #[serde(default)]
+    pub no_sandbox: bool,
+    /// The page target to render in (default: the first page).
+    #[serde(default)]
+    pub target_id: Option<String>,
+    /// The audio scene to render: {version: 1, scenario_id, layers: [...]}.
+    pub recipe: OfflineRecipe,
+    /// How much audio to render, in milliseconds (1..=120000; default 30000).
+    #[serde(default = "d_offline_duration_ms")]
+    pub duration_ms: u64,
+    /// Render sample rate in Hz (8000..=96000; default 48000).
+    #[serde(default = "d_offline_sample_rate")]
+    pub sample_rate: u32,
+    /// Overall limit for the whole render, in seconds (1..=600).
+    #[serde(default = "d_offline_timeout")]
+    pub timeout_secs: u64,
+    /// Values to redact wherever they appear in the result (names, labels).
+    #[serde(default)]
+    pub hidden_values: Vec<String>,
+}
+
+fn d_offline_duration_ms() -> u64 {
+    30_000
+}
+
+fn d_offline_sample_rate() -> u32 {
+    48_000
+}
+
+fn d_offline_timeout() -> u64 {
+    120
+}
+
+fn web_audio_offline_render(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
+    let p: OfflineRenderParams = parse_params(params)?;
+    if !(1..=120_000).contains(&p.duration_ms) {
+        return Err(ToolError::invalid(format!("duration_ms must be 1..=120000; {} is outside that window", p.duration_ms))
+            .with_remediation("Render at least a millisecond and at most two minutes of audio."));
+    }
+    if !(8_000..=96_000).contains(&p.sample_rate) {
+        return Err(ToolError::invalid(format!("sample_rate must be 8000..=96000; {} is outside that window", p.sample_rate))
+            .with_remediation("Use a browser-supported sample rate such as 44100 or 48000."));
+    }
+    let frames = u128::from(p.duration_ms).saturating_mul(u128::from(p.sample_rate)) / 1_000;
+    if frames > u128::from(MAX_OFFLINE_FRAMES) {
+        return Err(ToolError::new(
+            ErrorCode::OverLimit,
+            format!("rendering {} ms at {} Hz needs {frames} frames; at most {MAX_OFFLINE_FRAMES} are rendered", p.duration_ms, p.sample_rate),
+        )
+        .with_remediation("Render a shorter window or a lower sample rate."));
+    }
+    let plan = offline_recipe_plan(&p.recipe)?;
+    let expression = offline_render_script(&plan, p.duration_ms, p.sample_rate)?;
+
+    let dl = deadline(ctx, p.timeout_secs)?;
+    let launch = p.launch || p.cdp_endpoint.is_none();
+    let browser = resolve_browser(ctx, p.cdp_endpoint.as_deref(), launch, p.headless, p.no_sandbox, &dl)?;
+    let targets = cdp::json_list(&browser.endpoint, &dl)?;
+    let target = web_common::pick_target(&targets, p.target_id.as_deref(), Some("page"))?;
+    let mut client = web_common::connect_target(&browser, target, PAGE_MAX_MESSAGE, &dl)?;
+    // Runtime runs the recipe; no page domain is touched and nothing is navigated.
+    let _ = client.call("Runtime.enable", json!({}), None, &dl);
+    let reply = match client.call(
+        "Runtime.evaluate",
+        json!({
+            "expression": expression,
+            "awaitPromise": true,
+            "returnByValue": true,
+            "userGesture": true,
+        }),
+        None,
+        &dl,
+    ) {
+        Ok(reply) => reply,
+        Err(error) => return cleanup_then_err(&mut client, &dl, error),
+    };
+    if let Some(details) = reply.get("exceptionDetails") {
+        let text = details
+            .pointer("/exception/description")
+            .and_then(Value::as_str)
+            .or_else(|| details.get("text").and_then(Value::as_str))
+            .unwrap_or("the offline render script failed");
+        let error = ToolError::new(ErrorCode::ProgramFailed, format!("the page rejected the offline render: {}", clip_text(text, 400)))
+            .with_remediation("Reload the page and try again; a Content-Security-Policy that blocks injected scripts also blocks this render.");
+        return cleanup_then_err(&mut client, &dl, error);
+    }
+    let report = match parse_offline_render_reply(&reply) {
+        Ok(report) => report,
+        Err(error) => return cleanup_then_err(&mut client, &dl, error),
+    };
+    cleanup(&mut client, &dl);
+
+    let spectrum = number_list(&report, "spectrum")?;
+    let rms = number_list(&report, "rms")?;
+    let graph = report.get("graph").cloned().unwrap_or(Value::Null);
+    let mixer = report.get("mixer_state").cloned().unwrap_or_else(|| json!({}));
+    let mut fingerprint = audio::fingerprint_from_capture(&spectrum, &rms, graph, mixer, &[])?;
+    fingerprint.sample_rate =
+        report.get("sample_rate").and_then(Value::as_u64).and_then(|rate| u32::try_from(rate).ok()).filter(|rate| *rate > 0).unwrap_or(p.sample_rate);
+    fingerprint.captured_at_ms = now_unix_ms();
+    fingerprint.deep_mode = !ctx.session.clean_room();
+
+    let rendered_ms = report.get("rendered_ms").and_then(Value::as_u64).filter(|ms| (1..=120_000).contains(ms)).unwrap_or(p.duration_ms);
+    let node_count: u64 = fingerprint.graph_signature.node_counts.values().copied().fold(0u64, u64::saturating_add);
+    let edge_count = fingerprint.graph_signature.edges.len();
+    let kind_count = fingerprint.graph_signature.node_counts.len();
+    let log_bin_count = fingerprint.log_bins.len();
+    let rms_count = fingerprint.rms_envelope.len();
+    let fingerprint_sample_rate = fingerprint.sample_rate;
+    let scenario = if fingerprint.scenario_id.is_empty() { "an offline render".to_string() } else { fingerprint.scenario_id.clone() };
+    let mut secrets = Secrets::new(&p.hidden_values);
+    let name = secrets.text(&scenario);
+
+    let result = json!({
+        "fingerprint": fingerprint,
+        "rendered_ms": rendered_ms,
+        "browser": {"product": browser.product, "started_by": if browser.launched { "craft-anything" } else { "external" }, "cleanup": if browser.launched { "closed" } else { "disconnected" }},
+        "recipe": {
+            "version": OFFLINE_RECIPE_VERSION,
+            "scenario_id": p.recipe.scenario_id,
+            "layers": p.recipe.layers.len(),
+            "duration_ms": p.duration_ms,
+            "sample_rate": p.sample_rate,
+        },
+        "spectrum_values": spectrum.len(),
+        "rms_values": rms_count,
+        "graph_nodes": node_count,
+        "graph_edges": edge_count,
+        "secrets_hidden": p.hidden_values.len(),
+        "secret_redactions": 0,
+    });
+    let mut result = secrets.scrub(&result);
+    if let Some(object) = result.as_object_mut() {
+        object.insert("secret_redactions".into(), json!(secrets.redactions));
+    }
+    let summary = format!(
+        "Rendered {name} offline in {rendered_ms} ms: {log_bin_count} log bin(s), {rms_count} loudness value(s), {node_count} graph node(s) across {kind_count} kind(s) at {fingerprint_sample_rate} Hz."
+    );
+
+    let mut builder = EvidenceBuilder::new(
+        "web_audio_offline_render",
+        Subject { kind: "audio-scene".into(), sha256: None, name: Some(name) },
+        browser_env(ctx.session.clean_room(), &browser),
+    )
+    .params(json!({
+        "endpoint": browser.endpoint.origin,
+        "launched": browser.launched,
+        "duration_ms": p.duration_ms,
+        "sample_rate": p.sample_rate,
+        "recipe_version": OFFLINE_RECIPE_VERSION,
+        "layers": p.recipe.layers.len(),
+        "target_id": p.target_id,
+        "sensitive_value_declarations": p.hidden_values.len(),
+    }))
+    .result(result)
+    .summary(summary)
+    .confidence(Confidence::Observed)
+    .authority(Authority::OurRun)
+    .limitation(Limitation::new(
+        "offline_render_not_the_page",
+        "This is the recipe rendered offline, not the page's own audio: it matches only as far as the recipe reproduces the page's graph, settings and loudness.",
+    ))
+    .limitation(Limitation::new(
+        "single_window_spectrum",
+        "The spectrum is one FFT window from the middle of the render, not a time-averaged spectrum; the loudness envelope is one value per second.",
+    ))
+    .limitation(Limitation::new(
+        "no_interaction_trace",
+        "An offline render has no live interaction, so mixer_envelope is empty and only the recipe's layer settings are recorded.",
+    ))
+    .coverage(Coverage::complete(1))
+    .location(Location::new("url", browser.endpoint.origin.clone()));
+    if p.recipe.layers.is_empty() {
+        builder = builder.limitation(Limitation::new("empty_recipe", "The recipe had no layers, so the render is silent and its fingerprint has no energy."));
+    }
+    if report.get("truncated").and_then(Value::as_bool).unwrap_or(false) {
+        builder =
+            builder.limitation(Limitation::new("bounded_render", "Some graph edges, node kinds or spectrum bins were dropped to keep the result bounded."));
+    }
+    if p.hidden_values.iter().any(|value| !value.is_empty()) {
+        builder = builder.limitation(Limitation::new("secrets_redacted", format!("{} occurrence(s) of declared values were redacted", secrets.redactions)));
+    }
+    Ok(ToolOutput::evidence(builder.build()?))
+}
+
+/// Validate the recipe and turn it into the bounded object the page script embeds.
+fn offline_recipe_plan(recipe: &OfflineRecipe) -> Result<Value, ToolError> {
+    if recipe.version != OFFLINE_RECIPE_VERSION {
+        return Err(ToolError::invalid(format!(
+            "audio recipe version {} is not supported; this build renders version {OFFLINE_RECIPE_VERSION}",
+            recipe.version
+        ))
+        .with_remediation("Write the recipe with `version: 1`, or re-export it with this build."));
+    }
+    if recipe.layers.len() > MAX_OFFLINE_LAYERS {
+        return Err(ToolError::new(ErrorCode::OverLimit, format!("the recipe has {} layers; at most {MAX_OFFLINE_LAYERS} are rendered", recipe.layers.len()))
+            .with_remediation("Merge similar layers, or render the scene in a few recipes."));
+    }
+    let mut layers = Vec::with_capacity(recipe.layers.len());
+    for (index, layer) in recipe.layers.iter().enumerate() {
+        if layer.kind != "oscillator" {
+            return Err(ToolError::invalid(format!("layers[{index}].kind is {:?}; this build renders \"oscillator\"", layer.kind))
+                .with_remediation("Give each layer `kind: \"oscillator\"`; other node kinds arrive in a later recipe version."));
+        }
+        if !OFFLINE_WAVES.contains(&layer.wave.as_str()) {
+            return Err(ToolError::invalid(format!("layers[{index}].wave is {:?}; expected one of {}", layer.wave, OFFLINE_WAVES.join(", ")))
+                .with_remediation("Use a standard oscillator waveform: sine, square, sawtooth or triangle."));
+        }
+        let frequency = checked_offline_range(&format!("layers[{index}].frequency"), layer.frequency, 20.0, 20_000.0)?;
+        let gain = checked_offline_range(&format!("layers[{index}].gain"), layer.gain, 0.0, 2.0)?;
+        let pan = checked_offline_range(&format!("layers[{index}].pan"), layer.pan, -1.0, 1.0)?;
+        let id: String = layer.id.as_deref().unwrap_or("").chars().take(64).collect();
+        let id = if id.is_empty() { format!("layer_{index}") } else { id };
+        let filter = match &layer.filter {
+            None => Value::Null,
+            Some(filter) => {
+                if !OFFLINE_FILTERS.contains(&filter.kind.as_str()) {
+                    return Err(ToolError::invalid(format!(
+                        "layers[{index}].filter.kind is {:?}; expected one of {}",
+                        filter.kind,
+                        OFFLINE_FILTERS.join(", ")
+                    ))
+                    .with_remediation("Use a standard biquad filter type, e.g. `lowpass`."));
+                }
+                json!({
+                    "kind": filter.kind,
+                    "frequency": checked_offline_range(&format!("layers[{index}].filter.frequency"), filter.frequency, 20.0, 20_000.0)?,
+                    "q": checked_offline_range(&format!("layers[{index}].filter.q"), filter.q, 0.0001, 1_000.0)?,
+                })
+            }
+        };
+        layers.push(json!({"id": id, "kind": "oscillator", "wave": layer.wave, "frequency": frequency, "gain": gain, "pan": pan, "filter": filter}));
+    }
+    let scenario_id: String = recipe.scenario_id.as_deref().unwrap_or("").chars().take(120).collect();
+    Ok(json!({"version": OFFLINE_RECIPE_VERSION, "scenario_id": scenario_id, "layers": layers}))
+}
+
+fn checked_offline_range(name: &str, value: f64, low: f64, high: f64) -> Result<f64, ToolError> {
+    if !value.is_finite() || !(low..=high).contains(&value) {
+        return Err(ToolError::invalid(format!("{name} must be {low}..={high}; {value} is outside that range"))
+            .with_remediation("Use finite numbers: a frequency of 20 to 20000 Hz, a gain of 0 to 2, a pan of -1 to 1, and a positive Q."));
+    }
+    Ok(value)
+}
+
+/// The page script with the validated recipe and render window substituted.
+fn offline_render_script(plan: &Value, duration_ms: u64, sample_rate: u32) -> Result<String, ToolError> {
+    let recipe = serde_json::to_string(plan)
+        .map_err(|error| ToolError::internal(format!("couldn't encode the audio recipe: {error}")))?
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029");
+    Ok(OFFLINE_RENDER_SCRIPT
+        .replace("__RECIPE__", &recipe)
+        .replace("__DURATION_MS__", &duration_ms.to_string())
+        .replace("__SAMPLE_RATE__", &sample_rate.to_string()))
+}
+
+/// Build the recipe in an OfflineAudioContext, render it, then measure one FFT window and a 1 Hz
+/// loudness envelope from the rendered buffer. Bounded throughout; returns an `error` object rather
+/// than throwing for the cases the caller names (no OfflineAudioContext, a failed render or layer).
+const OFFLINE_RENDER_SCRIPT: &str = r#"
+(async () => {
+  const RECIPE = __RECIPE__;
+  const DURATION_MS = __DURATION_MS__;
+  const SAMPLE_RATE = __SAMPLE_RATE__;
+  const MAX_LAYERS = 256, MAX_SPECTRUM = 4096, MAX_RMS = 600, FFT_SIZE = 8192, MAX_EDGES = 2000;
+  const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  if (!OAC) return { error: 'no_offline_audio_context' };
+  const frames = Math.max(1, Math.round(DURATION_MS * SAMPLE_RATE / 1000));
+  const seconds = frames / SAMPLE_RATE;
+  const ctx = new OAC(2, frames, SAMPLE_RATE);
+  const counts = {}, edges = [];
+  const add = (kind) => { counts[kind] = (counts[kind] || 0) + 1; };
+  const link = (from, to) => {
+    if (edges.length < MAX_EDGES) edges.push({ from: String(from).slice(0, 64), to: String(to).slice(0, 64), kind: 'audio' });
+  };
+  const bus = ctx.createAnalyser();
+  add('analyser');
+  bus.connect(ctx.destination);
+  link('analyser', 'audio_destination');
+  const layers = Array.isArray(RECIPE.layers) ? RECIPE.layers.slice(0, MAX_LAYERS) : [];
+  for (let index = 0; index < layers.length; index += 1) {
+    const layer = layers[index] || {};
+    try {
+      const source = ctx.createOscillator();
+      source.type = layer.wave || 'sine';
+      source.frequency.setValueAtTime(typeof layer.frequency === 'number' ? layer.frequency : 220, 0);
+      add('oscillator');
+      let tail = source, tailKind = 'oscillator';
+      if (layer.filter) {
+        const node = ctx.createBiquadFilter();
+        node.type = layer.filter.kind || 'lowpass';
+        node.frequency.setValueAtTime(typeof layer.filter.frequency === 'number' ? layer.filter.frequency : 1000, 0);
+        node.Q.setValueAtTime(typeof layer.filter.q === 'number' ? layer.filter.q : 0.707, 0);
+        add('biquad_filter');
+        tail.connect(node);
+        link(tailKind, 'biquad_filter');
+        tail = node;
+        tailKind = 'biquad_filter';
+      }
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(typeof layer.gain === 'number' ? layer.gain : 0.5, 0);
+      add('gain');
+      tail.connect(gain);
+      link(tailKind, 'gain');
+      tail = gain;
+      tailKind = 'gain';
+      if (typeof layer.pan === 'number' && layer.pan !== 0) {
+        const panner = ctx.createStereoPanner();
+        panner.pan.setValueAtTime(layer.pan, 0);
+        add('stereo_panner');
+        tail.connect(panner);
+        link(tailKind, 'stereo_panner');
+        tail = panner;
+        tailKind = 'stereo_panner';
+      }
+      tail.connect(bus);
+      link(tailKind, 'analyser');
+      source.start(0);
+      source.stop(seconds);
+    } catch (error) {
+      return { error: 'layer_failed', message: String((error && error.message) || error).slice(0, 200), layer: index };
+    }
+  }
+  let buffer;
+  try {
+    buffer = await ctx.startRendering();
+  } catch (error) {
+    return { error: 'render_failed', message: String((error && error.message) || error).slice(0, 200) };
+  }
+  const channels = [];
+  for (let c = 0; c < buffer.numberOfChannels; c += 1) channels.push(buffer.getChannelData(c));
+  const rms = [];
+  const per = Math.max(1, Math.round(SAMPLE_RATE));
+  const rmsCount = Math.min(MAX_RMS, Math.ceil(buffer.length / per));
+  for (let bucket = 0; bucket < rmsCount; bucket += 1) {
+    const start = bucket * per, end = Math.min(buffer.length, start + per);
+    let sum = 0, count = 0;
+    for (const channel of channels) {
+      for (let i = start; i < end; i += 1) {
+        const value = channel[i] || 0;
+        sum += value * value;
+        count += 1;
+      }
+    }
+    rms.push(count > 0 ? Math.sqrt(sum / count) : 0);
+  }
+  // One Hann-windowed FFT from the middle of the render, mapped to the analyser's default dB range.
+  const n = FFT_SIZE;
+  const real = new Float64Array(n), imag = new Float64Array(n);
+  const offset = Math.max(0, Math.floor((buffer.length - n) / 2));
+  const window = new Float64Array(n);
+  for (let i = 0; i < n; i += 1) window[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / Math.max(1, n - 1));
+  for (let i = 0; i < n; i += 1) {
+    const at = offset + i;
+    let value = 0;
+    if (at < buffer.length) {
+      for (const channel of channels) value += channel[at] || 0;
+      value /= Math.max(1, channels.length);
+    }
+    real[i] = value * window[i];
+  }
+  for (let i = 1, j = 0; i < n; i += 1) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      const tr = real[i]; real[i] = real[j]; real[j] = tr;
+      const ti = imag[i]; imag[i] = imag[j]; imag[j] = ti;
+    }
+  }
+  for (let size = 2; size <= n; size <<= 1) {
+    const angle = -2 * Math.PI / size;
+    const wRe = Math.cos(angle), wIm = Math.sin(angle);
+    for (let start = 0; start < n; start += size) {
+      let curRe = 1, curIm = 0;
+      const half = size >> 1;
+      for (let k = 0; k < half; k += 1) {
+        const even = start + k, odd = even + half;
+        const tRe = real[odd] * curRe - imag[odd] * curIm;
+        const tIm = real[odd] * curIm + imag[odd] * curRe;
+        real[odd] = real[even] - tRe;
+        imag[odd] = imag[even] - tIm;
+        real[even] += tRe;
+        imag[even] += tIm;
+        const nextRe = curRe * wRe - curIm * wIm;
+        curIm = curRe * wIm + curIm * wRe;
+        curRe = nextRe;
+      }
+    }
+  }
+  const spectrum = [];
+  const MIN_DB = -100, MAX_DB = -30;
+  for (let bin = 0; bin < MAX_SPECTRUM && bin < n / 2; bin += 1) {
+    const magnitude = Math.hypot(real[bin], imag[bin]) / n;
+    const db = 20 * Math.log10(Math.max(magnitude, 1e-10));
+    spectrum.push(Math.max(0, Math.min(255, ((db - MIN_DB) / (MAX_DB - MIN_DB)) * 255)));
+  }
+  const mixerLayers = [];
+  for (const layer of layers.slice(0, 64)) {
+    mixerLayers.push({
+      id: String(layer.id || 'layer').slice(0, 64),
+      gain: typeof layer.gain === 'number' ? layer.gain : 0.5,
+      pan: typeof layer.pan === 'number' ? layer.pan : 0
+    });
+  }
+  return {
+    graph: { node_counts: counts, edges: edges },
+    spectrum: spectrum,
+    rms: rms,
+    mixer_state: { scenario_id: String(RECIPE.scenario_id || '').slice(0, 120), layers: mixerLayers },
+    sample_rate: ctx.sampleRate,
+    rendered_ms: Math.round(buffer.duration * 1000),
+    frames: buffer.length
+  };
+})()
+"#;
+
+/// Validate and bound the page's render report. A `null` value means the browser has no
+/// OfflineAudioContext; the page's named errors become typed errors with a remediation.
+fn parse_offline_render_reply(reply: &Value) -> Result<Value, ToolError> {
+    let value = reply.get("result").and_then(|result| result.get("value")).cloned().unwrap_or(Value::Null);
+    if value.is_null() {
+        return Err(ToolError::new(ErrorCode::FeatureMissing, "the browser has no OfflineAudioContext to render in")
+            .with_remediation("Use a Chromium-based browser; offline rendering needs OfflineAudioContext.")
+            .with_details(json!({"reason": "no_offline_audio_context"})));
+    }
+    if !value.is_object() {
+        return Err(
+            ToolError::new(ErrorCode::GarbledOutput, "the page's offline render report wasn't an object").with_remediation("Reload the page and try again.")
+        );
+    }
+    match value.get("error").and_then(Value::as_str) {
+        Some("no_offline_audio_context") => {
+            return Err(ToolError::new(ErrorCode::FeatureMissing, "the browser has no OfflineAudioContext to render in")
+                .with_remediation("Use a Chromium-based browser; offline rendering needs OfflineAudioContext.")
+                .with_details(json!({"reason": "no_offline_audio_context"})));
+        }
+        Some("render_failed") => {
+            let detail = value.get("message").and_then(Value::as_str).unwrap_or("the render failed");
+            return Err(ToolError::new(ErrorCode::ProgramFailed, format!("the offline render failed: {}", clip_text(detail, 300)))
+                .with_remediation("Check the recipe's frequencies, gains and filters, then try a shorter render."));
+        }
+        Some("layer_failed") => {
+            let detail = value.get("message").and_then(Value::as_str).unwrap_or("a layer could not be built");
+            let index = value.get("layer").and_then(Value::as_u64).unwrap_or(0);
+            return Err(ToolError::new(ErrorCode::ProgramFailed, format!("layer {index} could not be built: {}", clip_text(detail, 300)))
+                .with_remediation("Check the layer's waveform, frequency, gain and filter, then try again."));
+        }
+        Some(other) => {
+            return Err(ToolError::new(ErrorCode::GarbledOutput, format!("the page reported an unknown offline render error: {}", clip_text(other, 120)))
+                .with_remediation("Reload the page and try again; if it persists, the page may be overriding OfflineAudioContext."));
+        }
+        None => {}
+    }
+
+    let mut spectrum = number_list(&value, "spectrum")?;
+    spectrum.truncate(MAX_OFFLINE_SPECTRUM);
+    let mut rms = number_list(&value, "rms")?;
+    rms.truncate(MAX_OFFLINE_RMS);
+
+    let mut graph = value.get("graph").filter(|graph| graph.is_object()).cloned().unwrap_or_else(|| json!({"node_counts": {}, "edges": []}));
+    let mut truncated = false;
+    if let Some(edges) = graph.get_mut("edges").and_then(Value::as_array_mut)
+        && edges.len() > MAX_CAPTURE_EDGES
+    {
+        edges.truncate(MAX_CAPTURE_EDGES);
+        truncated = true;
+    }
+    if let Some(counts) = graph.get_mut("node_counts").and_then(Value::as_object_mut) {
+        while counts.len() > MAX_CAPTURE_KINDS {
+            let Some(kind) = counts.keys().next().cloned() else { break };
+            counts.remove(&kind);
+            truncated = true;
+        }
+    }
+
+    let mixer = value.get("mixer_state").filter(|state| state.is_object()).cloned().unwrap_or_else(|| json!({}));
+    let mixer_bytes = serde_json::to_string(&mixer).map(|text| text.len()).unwrap_or(0);
+    if mixer_bytes > MAX_MIXER_BYTES {
+        return Err(ToolError::new(ErrorCode::OverLimit, format!("the recipe's mixer state is {mixer_bytes} bytes; at most {MAX_MIXER_BYTES} are kept"))
+            .with_remediation("Use shorter layer names, or expose only the fields the comparison needs."));
+    }
+
+    let sample_rate = value.get("sample_rate").and_then(Value::as_u64).filter(|rate| (1..=384_000).contains(rate)).unwrap_or(48_000);
+    let rendered_ms = value.get("rendered_ms").and_then(Value::as_u64).unwrap_or(0);
+    Ok(json!({
+        "graph": graph,
+        "spectrum": spectrum,
+        "rms": rms,
+        "mixer_state": mixer,
+        "sample_rate": sample_rate,
+        "rendered_ms": rendered_ms,
+        "truncated": truncated,
+    }))
 }
 
 // ---------------------------------------------------------------------------------------------

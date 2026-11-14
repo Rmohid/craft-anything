@@ -75,6 +75,63 @@ fn http_json(stream: &mut TcpStream, body: &str) {
     let _ = stream.write_all(resp.as_bytes());
 }
 
+/// Start a fake CDP endpoint that answers discovery and the WebSocket upgrade but never replies to
+/// `hanging` methods, so a tool's call runs into its deadline (a wedged page, without a browser).
+fn fake_cdp_hanging_on(hanging: &[&str]) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("http://127.0.0.1:{port}");
+    let hanging: Arc<Vec<String>> = Arc::new(hanging.iter().map(|method| (*method).to_string()).collect());
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(stream) = s else { break };
+            let hanging = hanging.clone();
+            std::thread::spawn(move || serve_hanging(stream, port, hanging));
+        }
+    });
+    url
+}
+
+fn serve_hanging(mut stream: TcpStream, port: u16, hanging: Arc<Vec<String>>) {
+    let (request_line, headers) = read_headers(&mut stream);
+    let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+    if path.starts_with("/json/version") {
+        http_json(&mut stream, &json!({"Browser": "HeadlessChrome/120", "Protocol-Version": "1.3"}).to_string());
+        return;
+    }
+    if path.starts_with("/json/list") {
+        let list = json!([{
+            "id": "PAGE1",
+            "type": "page",
+            "title": "Offline",
+            "url": "about:blank",
+            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/page/PAGE1")
+        }]);
+        http_json(&mut stream, &list.to_string());
+        return;
+    }
+    if headers.iter().any(|(k, v)| k == "upgrade" && v.eq_ignore_ascii_case("websocket")) {
+        let key = headers.iter().find(|(k, _)| k == "sec-websocket-key").map(|(_, v)| v.clone()).unwrap_or_default();
+        let accept = ws_accept(&key);
+        let resp = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n");
+        let _ = stream.write_all(resp.as_bytes());
+        while let Some(msg) = ws_read(&mut stream) {
+            let req: Value = match serde_json::from_str(&msg) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let id = req.get("id").and_then(Value::as_u64).unwrap_or(0);
+            let method = req.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+            if hanging.iter().any(|refused| refused == &method) {
+                continue;
+            }
+            ws_write(&mut stream, &json!({"id": id, "result": {}}).to_string());
+        }
+        return;
+    }
+    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+}
+
 fn serve(mut stream: TcpStream, port: u16, ws_seen: Arc<AtomicBool>, eval: Arc<Value>, failing: Arc<Vec<String>>) {
     let (request_line, headers) = read_headers(&mut stream);
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
@@ -1399,4 +1456,93 @@ fn capture_marks_the_network_outline_unavailable_when_the_browser_refuses_it() {
         unavailable.iter().any(|reason| reason.as_str().unwrap_or_default().contains("Network.enable")),
         "a refused enable is named, not silently reported as no requests: {outline}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// web_audio_offline_render (Deep-only, headless OfflineAudioContext)
+
+/// Call web_audio_offline_render with the consent a foreign-code tool needs.
+fn offline_call(e: &Engine, p: Value) -> Result<Value, ToolError> {
+    e.call("web_audio_offline_render", p, CallOptions::new(Caller::Mcp).with_consent(crate::Consent::Granted)).map(|o| o.to_json())
+}
+
+/// What the offline recipe's page reports for a finished render (the script's own shape).
+fn offline_report() -> Value {
+    json!({
+        "graph": {
+            "node_counts": {"oscillator": 2, "biquad_filter": 1, "gain": 2, "analyser": 1, "audio_destination": 1},
+            "edges": [
+                {"from": "oscillator", "to": "biquad_filter", "kind": "audio"},
+                {"from": "biquad_filter", "to": "gain", "kind": "audio"},
+                {"from": "gain", "to": "analyser", "kind": "audio"},
+                {"from": "analyser", "to": "audio_destination", "kind": "audio"}
+            ]
+        },
+        "spectrum": [0.0, 12.0, 40.0, 120.0, 255.0, 90.0],
+        "rms": [0.12, 0.2, 0.18],
+        "mixer_state": {"scenario_id": "focus", "layers": [{"id": "pad", "gain": 0.4, "pan": 0.0}]},
+        "sample_rate": 48000,
+        "rendered_ms": 30000,
+        "frames": 1440000
+    })
+}
+
+#[test]
+fn offline_render_timeout_is_typed_error() {
+    // The page never answers Runtime.evaluate: the call runs into its own deadline.
+    let url = fake_cdp_hanging_on(&["Runtime.evaluate"]);
+    let e = Engine::new(crate::testing::session());
+    let err = offline_call(&e, json!({"cdp_endpoint": url, "recipe": {"version": 1, "layers": []}, "duration_ms": 30000, "timeout_secs": 2})).unwrap_err();
+    assert_eq!(err.code, ErrorCode::TimedOut, "{}", err.message);
+}
+
+#[test]
+fn offline_render_returns_a_fingerprint_web_audio_compare_accepts() {
+    let (url, _) = fake_cdp_with_eval(offline_report());
+    let e = Engine::new(crate::testing::session());
+    let v = offline_call(
+        &e,
+        json!({
+            "cdp_endpoint": url,
+            "recipe": {"version": 1, "scenario_id": "focus", "layers": [
+                {"id": "pad", "kind": "oscillator", "wave": "sine", "frequency": 220.0, "gain": 0.4},
+                {"id": "bass", "kind": "oscillator", "wave": "triangle", "frequency": 110.0, "gain": 0.2,
+                 "filter": {"kind": "lowpass", "frequency": 800.0, "q": 0.7}}
+            ]},
+            "duration_ms": 30000
+        }),
+    )
+    .unwrap();
+    let r = &v["result"];
+    assert_eq!(r["rendered_ms"], 30000);
+    assert_eq!(r["fingerprint"]["scenario_id"], "focus");
+    assert_eq!(r["fingerprint"]["version"], 1);
+    assert_eq!(r["fingerprint"]["deep_mode"], true, "offline rendering is Deep-only");
+    assert_eq!(r["fingerprint"]["log_bins"].as_array().map(Vec::len), Some(48));
+    assert_eq!(r["fingerprint"]["rms_envelope"].as_array().map(Vec::len), Some(3));
+    assert_eq!(r["fingerprint"]["graph_signature"]["node_counts"]["biquad_filter"], 1);
+    assert_eq!(v["confidence"], "observed");
+
+    // The output shape is exactly what web_audio_compare accepts as `after`.
+    let cmp = call(&e, "web_audio_compare", json!({"before": &r["fingerprint"], "after": v.clone()})).unwrap();
+    assert_eq!(cmp["result"]["likeness_pass"], true, "{}", cmp["result"]);
+}
+
+#[test]
+fn offline_render_refuses_recipes_outside_its_bounds_before_touching_a_browser() {
+    let e = Engine::new(crate::testing::session());
+    let layers = vec![json!({"kind": "oscillator", "wave": "sine"}); 257];
+    for (params, expected) in [
+        (json!({"recipe": {"version": 1, "layers": []}, "duration_ms": 0}), ErrorCode::BadInput),
+        (json!({"recipe": {"version": 1, "layers": []}, "duration_ms": 120_001}), ErrorCode::BadInput),
+        (json!({"recipe": {"version": 2, "layers": []}, "duration_ms": 1000}), ErrorCode::BadInput),
+        (json!({"recipe": {"version": 1, "layers": layers}, "duration_ms": 1000}), ErrorCode::OverLimit),
+        (json!({"recipe": {"version": 1, "layers": [{"kind": "oscillator", "wave": "meow"}]}, "duration_ms": 1000}), ErrorCode::BadInput),
+        (json!({"recipe": {"version": 1, "layers": []}, "duration_ms": 120_000, "sample_rate": 96_000}), ErrorCode::OverLimit),
+    ] {
+        let mut params = params;
+        params["cdp_endpoint"] = json!("http://127.0.0.1:9");
+        let err = offline_call(&e, params.clone()).unwrap_err();
+        assert_eq!(err.code, expected, "{params}: {}", err.message);
+    }
 }
