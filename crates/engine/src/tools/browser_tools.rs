@@ -2981,6 +2981,7 @@ const OFFLINE_RENDER_SCRIPT: &str = r#"
   const bus = ctx.createAnalyser();
   add('analyser');
   bus.connect(ctx.destination);
+  add('audio_destination');
   link('analyser', 'audio_destination');
   const layers = Array.isArray(RECIPE.layers) ? RECIPE.layers.slice(0, MAX_LAYERS) : [];
   for (let index = 0; index < layers.length; index += 1) {

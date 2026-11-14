@@ -1529,6 +1529,76 @@ fn offline_render_returns_a_fingerprint_web_audio_compare_accepts() {
 }
 
 #[test]
+fn live_capture_and_offline_render_graphs_do_not_differ_on_the_destination() {
+    // A live capture names AudioDestinationNode "audio_destination": its connect wrapper records
+    // the node on the other end of every connection. The offline rebuild must count the same node
+    // kind, or every live-vs-render comparison reports a graph difference it invented.
+    let (url, _) = fake_cdp_with_eval(offline_report());
+    let e = Engine::new(crate::testing::session());
+    let rendered = offline_call(
+        &e,
+        json!({
+            "cdp_endpoint": url,
+            "recipe": {"version": 1, "scenario_id": "focus", "layers": [
+                {"id": "pad", "kind": "oscillator", "wave": "sine", "frequency": 220.0, "gain": 0.4},
+                {"id": "bass", "kind": "oscillator", "wave": "triangle", "frequency": 110.0, "gain": 0.2,
+                 "filter": {"kind": "lowpass", "frequency": 800.0, "q": 0.7}}
+            ]},
+            "duration_ms": 30000
+        }),
+    )
+    .unwrap();
+    let live = call(
+        &e,
+        "web_audio_fingerprint",
+        json!({
+            "spectrum": [0.0, 12.0, 40.0, 120.0, 255.0, 90.0],
+            "rms": [0.12, 0.2, 0.18],
+            "graph": {
+                "node_counts": {"oscillator": 2, "biquad_filter": 1, "gain": 2, "analyser": 1, "audio_destination": 1},
+                "edges": [
+                    {"from": "oscillator", "to": "biquad_filter", "kind": "audio"},
+                    {"from": "biquad_filter", "to": "gain", "kind": "audio"},
+                    {"from": "gain", "to": "analyser", "kind": "audio"},
+                    {"from": "analyser", "to": "audio_destination", "kind": "audio"}
+                ]
+            },
+            "mixer_state": {"scenario_id": "focus"}
+        }),
+    )
+    .unwrap();
+    let cmp = call(&e, "web_audio_compare", json!({"before": live, "after": rendered})).unwrap();
+    let diff = &cmp["result"]["graph_diff"];
+    assert_eq!(diff["same"], true, "the only difference would be an invented destination: {diff}");
+    assert_eq!(diff["added_nodes"], json!({}), "{diff}");
+    assert_eq!(diff["removed_nodes"], json!({}), "{diff}");
+    assert_eq!(cmp["result"]["likeness_pass"], true, "{}", cmp["result"]);
+}
+
+#[test]
+fn offline_render_script_counts_the_same_node_kinds_as_a_live_capture() {
+    // Cheap shape guard, not an execution: the script only runs for real in Task 6's live browser
+    // run. A live capture derives node kinds in AUDIO_CAPTURE_SCRIPT's kindOf() by dropping the
+    // "Node" suffix and camel-casing to snake_case, which yields these names:
+    assert!(super::AUDIO_CAPTURE_SCRIPT.contains("replace(/Node$/, '')"));
+    assert!(super::AUDIO_CAPTURE_SCRIPT.contains("replace(/([a-z0-9])([A-Z])/g, '$1_$2')"));
+    for (constructor, kind) in [
+        ("OscillatorNode", "oscillator"),
+        ("BiquadFilterNode", "biquad_filter"),
+        ("GainNode", "gain"),
+        ("StereoPannerNode", "stereo_panner"),
+        ("AnalyserNode", "analyser"),
+        ("AudioDestinationNode", "audio_destination"),
+    ] {
+        assert!(
+            super::OFFLINE_RENDER_SCRIPT.contains(&format!("add('{kind}')")),
+            "the offline script never counts {kind} (a live capture names {constructor} that way)"
+        );
+    }
+    assert!(super::OFFLINE_RENDER_SCRIPT.contains("link('analyser', 'audio_destination')"), "the destination edge must be recorded too");
+}
+
+#[test]
 fn offline_render_refuses_recipes_outside_its_bounds_before_touching_a_browser() {
     let e = Engine::new(crate::testing::session());
     let layers = vec![json!({"kind": "oscillator", "wave": "sine"}); 257];
