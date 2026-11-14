@@ -135,6 +135,13 @@ impl Deadline {
     pub fn expired(&self) -> bool {
         self.cancel.is_cancelled() || self.at.saturating_duration_since(Instant::now()).is_zero()
     }
+
+    /// A child deadline for work nested inside this one: at most `max`, and never later than the
+    /// parent, so a step cannot outlive the whole-run budget the caller was promised.
+    pub fn slice(&self, max: Duration) -> Self {
+        let left = self.at.saturating_duration_since(Instant::now()).min(max);
+        Deadline { at: Instant::now().checked_add(left).unwrap_or_else(Instant::now), cancel: self.cancel.clone() }
+    }
 }
 
 fn timeout_err() -> ToolError {
@@ -756,5 +763,15 @@ mod tests {
     fn find_helper() {
         assert_eq!(find(b"abc\r\n\r\nxyz", b"\r\n\r\n"), Some(3));
         assert_eq!(find(b"abc", b"\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn a_slice_never_outlives_its_parent() {
+        let cancel = CancelToken::default();
+        let parent = Deadline::new(Duration::from_millis(50), cancel);
+        // A generous step budget is cut down to the parent's remaining time.
+        assert!(!parent.slice(Duration::from_secs(30)).expired());
+        // A zero-length slice of any parent is already past it.
+        assert!(parent.slice(Duration::ZERO).expired());
     }
 }

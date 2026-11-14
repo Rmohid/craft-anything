@@ -2404,7 +2404,12 @@ const AUDIO_CAPTURE_SCRIPT: &str = r#"
     // gain and its panner as one mixer layer instead of inventing two.
     if (!Array.isArray(state.links)) state.links = [];
     const record = (node) => {
-      try { if (node && state.nodes.size < MAX_NODES) state.nodes.add(node); } catch (error) {}
+      try {
+        if (node) {
+          if (state.nodes.size < MAX_NODES) state.nodes.add(node);
+          else state.truncated = true;
+        }
+      } catch (error) {}
       return node;
     };
     const creators = ['createGain', 'createOscillator', 'createAnalyser', 'createBiquadFilter', 'createDelay', 'createConvolver', 'createDynamicsCompressor', 'createPanner', 'createStereoPanner', 'createWaveShaper', 'createChannelSplitter', 'createChannelMerger', 'createConstantSource', 'createBufferSource', 'createMediaElementSource', 'createMediaStreamSource', 'createScriptProcessor', 'createPeriodicWave'];
@@ -2730,13 +2735,15 @@ fn run_interaction_trace(client: &mut CdpClient, p: &CaptureAudioParams, secrets
             break;
         }
         ctx.report(Some(index as f32 / p.steps.len().max(1) as f32), format!("interaction trace step {}", index + 1));
-        let step_dl = Deadline::new(Duration::from_millis(30_000), ctx.cancel.clone());
+        // Each step and its settle are capped by the time left, so 200 steps cannot run past the
+        // deadline the caller advertised.
+        let step_dl = dl.slice(Duration::from_millis(30_000));
         if let Err(error) = run_action(client, &step.action, secrets, &step_dl) {
-            run.aborted = Some(format!("step {} failed: {}", index + 1, error.message));
+            run.aborted = Some(if dl.expired() { "the overall deadline passed".into() } else { format!("step {} failed: {}", index + 1, error.message) });
             break;
         }
         // Let the 10 Hz poll take a reading after each step, so a stair-step move is visible.
-        let settle = Deadline::new(Duration::from_millis(TRACE_SETTLE_MS), ctx.cancel.clone());
+        let settle = dl.slice(Duration::from_millis(TRACE_SETTLE_MS));
         let _ = client.pump_until(&settle);
     }
 
@@ -3213,6 +3220,7 @@ fn web_audio_offline_render(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutp
         },
         "spectrum_values": spectrum.len(),
         "rms_values": rms_count,
+        "truncated": report.get("truncated").and_then(Value::as_bool).unwrap_or(false),
         "graph_nodes": node_count,
         "graph_edges": edge_count,
         "secrets_hidden": p.hidden_values.len(),
@@ -3678,12 +3686,13 @@ fn parse_offline_render_reply(reply: &Value) -> Result<Value, ToolError> {
     }
 
     let mut spectrum = number_list(&value, "spectrum")?;
+    let mut truncated = spectrum.len() > MAX_OFFLINE_SPECTRUM;
     spectrum.truncate(MAX_OFFLINE_SPECTRUM);
     let mut rms = number_list(&value, "rms")?;
+    truncated |= rms.len() > MAX_OFFLINE_RMS;
     rms.truncate(MAX_OFFLINE_RMS);
 
     let mut graph = value.get("graph").filter(|graph| graph.is_object()).cloned().unwrap_or_else(|| json!({"node_counts": {}, "edges": []}));
-    let mut truncated = false;
     if let Some(edges) = graph.get_mut("edges").and_then(Value::as_array_mut)
         && edges.len() > MAX_CAPTURE_EDGES
     {

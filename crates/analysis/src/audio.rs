@@ -242,15 +242,15 @@ pub fn rms_envelope(samples: &[f32], sample_rate: u32, window_ms: u32) -> Vec<f3
 /// Identical shapes score `1.0`. When either spectrum has zero energy (silence, or an analyser
 /// that returned zeros) the score is `0.0` rather than a NaN, so the caller can record a
 /// `low_energy` limitation and fail the likeness verdict. Different lengths are a
-/// [`ErrorCode::BadInput`]: fingerprint both captures with the same `bins` count.
+/// [`ErrorCode::BadInput`]: re-fingerprint both captures with this build.
 pub fn spectral_cosine(a: &[f32], b: &[f32]) -> Result<f64, ToolError> {
     if a.len() != b.len() {
         return Err(ToolError::invalid(format!("the two spectra have {} and {} values", a.len(), b.len()))
-            .with_remediation("Fingerprint both captures with the same `bins` value."));
+            .with_remediation("Fingerprints are currently 48 log bins; re-fingerprint both captures with this build."));
     }
     if a.len() > MAX_ELEMENTS {
         return Err(ToolError::new(ErrorCode::OverLimit, format!("the spectra have {} values; at most {MAX_ELEMENTS} are compared", a.len()))
-            .with_remediation("Fingerprint both captures with fewer `bins`."));
+            .with_remediation("Fingerprint a shorter spectrum; a capture fingerprints at 48 log bins."));
     }
 
     let mut dot = 0.0f64;

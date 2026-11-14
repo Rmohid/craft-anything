@@ -8,6 +8,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 fn call(e: &Engine, id: &str, p: Value) -> Result<Value, ToolError> {
     e.call(id, p, CallOptions::new(Caller::Mcp)).map(|o| o.to_json())
@@ -40,6 +41,12 @@ fn fake_cdp_with_trace(value: Value, trace: Value) -> (String, Arc<AtomicBool>) 
 }
 
 fn fake_cdp_full(value: Value, failing: &[&str], trace: Option<Value>) -> (String, Arc<AtomicBool>) {
+    fake_cdp_full_with_hanging(value, failing, trace, &[])
+}
+
+/// As [`fake_cdp_full`], but the browser accepts `hanging` methods and never answers them (what an
+/// unresponsive page or a wedged renderer does), so a step's own deadline can be exercised.
+fn fake_cdp_full_with_hanging(value: Value, failing: &[&str], trace: Option<Value>, hanging: &[&str]) -> (String, Arc<AtomicBool>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let url = format!("http://127.0.0.1:{port}");
@@ -47,6 +54,7 @@ fn fake_cdp_full(value: Value, failing: &[&str], trace: Option<Value>) -> (Strin
     let ws_seen2 = ws_seen.clone();
     let eval = Arc::new(value);
     let failing: Arc<Vec<String>> = Arc::new(failing.iter().map(|method| (*method).to_string()).collect());
+    let hanging: Arc<Vec<String>> = Arc::new(hanging.iter().map(|method| (*method).to_string()).collect());
     let trace = trace.map(Arc::new);
     std::thread::spawn(move || {
         for s in listener.incoming() {
@@ -54,8 +62,9 @@ fn fake_cdp_full(value: Value, failing: &[&str], trace: Option<Value>) -> (Strin
             let seen = ws_seen2.clone();
             let eval = eval.clone();
             let failing = failing.clone();
+            let hanging = hanging.clone();
             let trace = trace.clone();
-            std::thread::spawn(move || serve(stream, port, seen, eval, failing, trace));
+            std::thread::spawn(move || serve(stream, port, seen, eval, failing, trace, hanging));
         }
     });
     (url, ws_seen)
@@ -144,7 +153,15 @@ fn serve_hanging(mut stream: TcpStream, port: u16, hanging: Arc<Vec<String>>) {
     let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 }
 
-fn serve(mut stream: TcpStream, port: u16, ws_seen: Arc<AtomicBool>, eval: Arc<Value>, failing: Arc<Vec<String>>, trace: Option<Arc<Value>>) {
+fn serve(
+    mut stream: TcpStream,
+    port: u16,
+    ws_seen: Arc<AtomicBool>,
+    eval: Arc<Value>,
+    failing: Arc<Vec<String>>,
+    trace: Option<Arc<Value>>,
+    hanging: Arc<Vec<String>>,
+) {
     let (request_line, headers) = read_headers(&mut stream);
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
     if path.starts_with("/json/version") {
@@ -172,7 +189,7 @@ fn serve(mut stream: TcpStream, port: u16, ws_seen: Arc<AtomicBool>, eval: Arc<V
         let accept = ws_accept(&key);
         let resp = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n");
         let _ = stream.write_all(resp.as_bytes());
-        serve_ws(&mut stream, &eval, &failing, trace.as_deref());
+        serve_ws(&mut stream, &eval, &failing, trace.as_deref(), &hanging);
         ws_seen.store(true, Ordering::Relaxed);
         return;
     }
@@ -239,7 +256,7 @@ fn ws_write(stream: &mut TcpStream, text: &str) {
     let _ = stream.write_all(&frame);
 }
 
-fn serve_ws(stream: &mut TcpStream, eval: &Value, failing: &[String], trace: Option<&Value>) {
+fn serve_ws(stream: &mut TcpStream, eval: &Value, failing: &[String], trace: Option<&Value>, hanging: &[String]) {
     let bundle = craft_anything_testkit::electron::WEBPACK_BUNDLE;
     while let Some(msg) = ws_read(stream) {
         let req: Value = match serde_json::from_str(&msg) {
@@ -248,6 +265,9 @@ fn serve_ws(stream: &mut TcpStream, eval: &Value, failing: &[String], trace: Opt
         };
         let id = req.get("id").and_then(Value::as_u64).unwrap_or(0);
         let method = req.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+        if hanging.iter().any(|refused| refused == &method) {
+            continue;
+        }
         if failing.iter().any(|refused| refused == &method) {
             ws_write(stream, &json!({"id": id, "error": {"code": -32601, "message": format!("'{method}' wasn't found")}}).to_string());
             continue;
@@ -1593,6 +1613,51 @@ fn capture_refuses_too_many_interaction_steps() {
 }
 
 #[test]
+fn a_slow_step_cannot_outlive_the_capture_deadline() {
+    // The page accepts a navigation and never answers it. The step must be cut down to the time
+    // `timeout_secs` left, not given a fresh 30 s allowance that outlives the whole capture.
+    let (url, _) = fake_cdp_full_with_hanging(audio_report(), &[], None, &["Page.navigate"]);
+    let e = Engine::new(crate::testing::session());
+    let steps: Vec<Value> = (0..5).map(|i| json!({"kind": "goto", "url": format!("https://app.test/step-{i}")})).collect();
+    let started = std::time::Instant::now();
+    let v = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000, "interaction_trace": true, "steps": steps, "timeout_secs": 1})).unwrap();
+    let elapsed = started.elapsed();
+    let trace = &v["result"]["interaction_trace"];
+    assert_eq!(trace["aborted"], "the overall deadline passed", "{trace}");
+    assert!(elapsed < Duration::from_secs(10), "the run stopped on its own deadline, not the 30 s step allowance: {elapsed:?}");
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(codes.contains(&"trace_aborted"), "{codes:?}");
+}
+
+#[test]
+fn capture_marks_an_over_cap_graph_and_spectrum_as_truncated() {
+    // The page reports more than the capture keeps: the evidence must say the data is bounded,
+    // not present the capped arrays as complete.
+    let mut report = audio_report();
+    report["spectrum"] = json!(vec![1.0; 5_000]);
+    report["graph"]["edges"] = Value::Array((0..2_001).map(|i| json!({"from": format!("n{i}"), "to": format!("m{i}"), "kind": "audio"})).collect());
+    let (url, _) = fake_cdp_with_eval(report);
+    let e = Engine::new(crate::testing::session());
+    let v = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000})).unwrap();
+    let r = &v["result"];
+    assert_eq!(r["graph_truncated"], true, "{r}");
+    assert_eq!(r["spectrum_truncated"], true, "{r}");
+    assert_eq!(r["spectrum"].as_array().map(Vec::len), Some(4_096));
+    assert_eq!(r["graph"]["edges"].as_array().map(Vec::len), Some(2_000));
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(codes.contains(&"bounded_capture"), "{codes:?}");
+}
+
+#[test]
+fn capture_script_marks_a_node_cap_as_truncated() {
+    // Shape guard: the recorder runs in the page, so assert the over-cap branch records the drop
+    // instead of returning the node as if it had been kept.
+    let script = super::audio_capture_script(5000);
+    assert!(script.contains("if (state.nodes.size < MAX_NODES) state.nodes.add(node);"), "the node cap is enforced");
+    assert!(script.contains("else state.truncated = true;"), "a refused node sets the truncated flag: the drop is recorded, never silent");
+}
+
+#[test]
 fn capture_names_params_the_trace_had_to_default() {
     // A layer that only exposes .pan has no observed gain (the page never declared one), so the
     // sampler records unity and counts the default instead of passing it off as measured.
@@ -1714,6 +1779,33 @@ fn offline_render_timeout_is_typed_error() {
     let e = Engine::new(crate::testing::session());
     let err = offline_call(&e, json!({"cdp_endpoint": url, "recipe": {"version": 1, "layers": []}, "duration_ms": 30000, "timeout_secs": 2})).unwrap_err();
     assert_eq!(err.code, ErrorCode::TimedOut, "{}", err.message);
+}
+
+#[test]
+fn offline_render_records_a_truncated_spectrum_and_rms() {
+    // The page returns more than the render keeps: the evidence must say the result is bounded
+    // rather than present the capped arrays as the whole render.
+    let mut report = offline_report();
+    report["spectrum"] = json!(vec![1.0; 5_000]);
+    report["rms"] = json!(vec![0.1; 700]);
+    let (url, _) = fake_cdp_with_eval(report);
+    let e = Engine::new(crate::testing::session());
+    let v = offline_call(
+        &e,
+        json!({
+            "cdp_endpoint": url,
+            "recipe": {"version": 1, "layers": [{"id": "pad", "kind": "oscillator", "wave": "sine", "frequency": 220.0, "gain": 0.4}]},
+            "duration_ms": 30000
+        }),
+    )
+    .unwrap();
+    let r = &v["result"];
+    assert_eq!(r["truncated"], true, "{r}");
+    assert_eq!(r["spectrum_values"], 4_096, "{r}");
+    assert_eq!(r["rms_values"], 600, "{r}");
+    assert_eq!(r["fingerprint"]["rms_envelope"].as_array().map(Vec::len), Some(600));
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(codes.contains(&"bounded_render"), "{codes:?}");
 }
 
 #[test]
