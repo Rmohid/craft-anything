@@ -2954,12 +2954,14 @@ const MAX_OFFLINE_RMS: usize = 600;
 const OFFLINE_WAVES: &[&str] = &["sine", "square", "sawtooth", "triangle"];
 /// Biquad filter kinds an offline recipe may ask for.
 const OFFLINE_FILTERS: &[&str] = &["lowpass", "highpass", "bandpass", "notch", "peaking", "lowshelf", "highshelf"];
-/// Most gain/pan points one layer's envelope may hold (ten minutes at 10 Hz).
+/// Most gain/pan points one layer's declared envelope may hold (ten minutes at 10 Hz).
 const MAX_OFFLINE_ENVELOPE: usize = 6_000;
-/// Most gain/pan points a whole recipe's envelopes may hold.
+/// Most mixer readings the fingerprint keeps; a recipe's envelopes share this budget, so each
+/// layer's even grid is only as fine as its share allows.
 const MAX_OFFLINE_ENVELOPE_TOTAL: usize = 6_000;
-/// The uniform grid an offline envelope is resampled to, in milliseconds, so the curve
-/// `setValueCurveAtTime` spreads evenly matches the times the fingerprint records.
+/// Target spacing for an offline envelope, in milliseconds. The actual even spacing is the
+/// layer's last declared time divided by `points - 1`, so it is at most this unless the recipe's
+/// envelopes have to share the reading budget.
 const OFFLINE_ENVELOPE_STEP_MS: u64 = 100;
 
 /// The audio scene to rebuild: a version, the scenario it stands for, and its layers.
@@ -3260,7 +3262,7 @@ fn web_audio_offline_render(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutp
         ));
         builder = builder.limitation(Limitation::new(
             "envelope_resampled",
-            "The declared envelope is resampled to a uniform 10 Hz grid, because a value curve spreads its points evenly; the fingerprint records those grid times, which are what played.",
+            "The declared envelope is resampled to an even grid: each value sits at the layer's last point divided by (values - 1), targeting 100 ms but coarser when the recipe's envelopes share the fingerprint's 6000-reading budget. The fingerprint records those positions rounded to the nearest millisecond.",
         ));
     } else {
         builder = builder.limitation(Limitation::new(
@@ -3296,8 +3298,12 @@ fn offline_recipe_plan(recipe: &OfflineRecipe, duration_ms: u64) -> Result<Value
         return Err(ToolError::new(ErrorCode::OverLimit, format!("the recipe has {} layers; at most {MAX_OFFLINE_LAYERS} are rendered", recipe.layers.len()))
             .with_remediation("Merge similar layers, or render the scene in a few recipes."));
     }
+    // Every envelope shares the fingerprint's reading budget. Count the layers with one first, so
+    // a legal long render (up to 120 s per layer) is not refused for the internal resample grid;
+    // each layer's share only widens its own spacing.
+    let envelope_layers = recipe.layers.iter().filter(|layer| layer.envelope.as_deref().is_some_and(|points| !points.is_empty())).count();
+    let per_layer_points = MAX_OFFLINE_ENVELOPE_TOTAL.checked_div(envelope_layers).unwrap_or(MAX_OFFLINE_ENVELOPE).max(2);
     let mut layers = Vec::with_capacity(recipe.layers.len());
-    let mut envelope_total = 0usize;
     for (index, layer) in recipe.layers.iter().enumerate() {
         if layer.kind != "oscillator" {
             return Err(ToolError::invalid(format!("layers[{index}].kind is {:?}; this build renders \"oscillator\"", layer.kind))
@@ -3312,15 +3318,7 @@ fn offline_recipe_plan(recipe: &OfflineRecipe, duration_ms: u64) -> Result<Value
         let pan = checked_offline_range(&format!("layers[{index}].pan"), layer.pan, -1.0, 1.0)?;
         let id: String = layer.id.as_deref().unwrap_or("").chars().take(64).collect();
         let id = if id.is_empty() { format!("layer_{index}") } else { id };
-        let envelope = offline_envelope_points(&format!("layers[{index}].envelope"), layer.envelope.as_deref(), duration_ms)?;
-        envelope_total = envelope_total.saturating_add(envelope.len());
-        if envelope_total > MAX_OFFLINE_ENVELOPE_TOTAL {
-            return Err(ToolError::new(
-                ErrorCode::OverLimit,
-                format!("the recipe's envelopes hold more than {MAX_OFFLINE_ENVELOPE_TOTAL} points; each layer may hold {MAX_OFFLINE_ENVELOPE}"),
-            )
-            .with_remediation("Render fewer layers, or give each layer a coarser trajectory."));
-        }
+        let envelope = offline_envelope_points(&format!("layers[{index}].envelope"), layer.envelope.as_deref(), duration_ms, per_layer_points)?;
         let filter = match &layer.filter {
             None => Value::Null,
             Some(filter) => {
@@ -3345,14 +3343,17 @@ fn offline_recipe_plan(recipe: &OfflineRecipe, duration_ms: u64) -> Result<Value
     Ok(json!({"version": OFFLINE_RECIPE_VERSION, "scenario_id": scenario_id, "layers": layers}))
 }
 
-/// Validate one layer's gain/pan trajectory, then resample it to the uniform grid
-/// [`OFFLINE_ENVELOPE_STEP_MS`] on which `setValueCurveAtTime` spreads its values. Requiring at
-/// least two points, non-decreasing times, gain 0..=2, pan -1..=1, no point past `duration_ms`,
-/// and at most [`MAX_OFFLINE_ENVELOPE`] points. Layers without an envelope become an empty list.
+/// Validate one layer's gain/pan trajectory, then resample it to an even grid whose target
+/// spacing is [`OFFLINE_ENVELOPE_STEP_MS`], limited to `max_points` (the layer's share of the
+/// fingerprint's reading budget). Requiring at least two points, non-decreasing times, gain
+/// 0..=2, pan -1..=1, no point past `duration_ms`, and at most [`MAX_OFFLINE_ENVELOPE`] declared
+/// points. Layers without an envelope become an empty list.
 ///
-/// Resampling is what makes the fingerprint honest: the scheduled curve honours every point on
-/// this grid, so the recorded `t_ms` values are the ones the render actually played.
-fn offline_envelope_points(name: &str, points: Option<&[OfflineEnvelopePoint]>, duration_ms: u64) -> Result<Vec<Value>, ToolError> {
+/// `setValueCurveAtTime` spreads its values evenly over the span, so the actual spacing is the
+/// layer's last declared time divided by `points - 1`: at most the 100 ms target, but coarser when
+/// the recipe's envelopes share the budget. Every value sits at that even position; the
+/// fingerprint records it to the nearest millisecond, which is where the render played it.
+fn offline_envelope_points(name: &str, points: Option<&[OfflineEnvelopePoint]>, duration_ms: u64, max_points: usize) -> Result<Vec<Value>, ToolError> {
     let Some(points) = points.filter(|points| !points.is_empty()) else { return Ok(Vec::new()) };
     if points.len() > MAX_OFFLINE_ENVELOPE {
         return Err(ToolError::new(ErrorCode::OverLimit, format!("{name} holds {} points; at most {MAX_OFFLINE_ENVELOPE} are rendered", points.len()))
@@ -3385,7 +3386,8 @@ fn offline_envelope_points(name: &str, points: Option<&[OfflineEnvelopePoint]>, 
         return Err(ToolError::invalid(format!("{name} ends at 0 ms; a trajectory needs time to play"))
             .with_remediation("Move the last point to at least a millisecond after the first."));
     }
-    let span = last.div_ceil(OFFLINE_ENVELOPE_STEP_MS).saturating_add(1).min(MAX_OFFLINE_ENVELOPE as u64).max(2);
+    let max_points = max_points.clamp(2, MAX_OFFLINE_ENVELOPE);
+    let span = last.div_ceil(OFFLINE_ENVELOPE_STEP_MS).saturating_add(1).min(max_points as u64).max(2);
     let mut out = Vec::with_capacity(usize::try_from(span).unwrap_or(MAX_OFFLINE_ENVELOPE));
     for index in 0..span {
         let at = ((index as f64) * (last as f64) / ((span - 1) as f64)).round() as u64;

@@ -1842,7 +1842,7 @@ fn offline_render_schedules_layer_envelopes_and_fingerprints_them() {
     });
     let v = offline_call(&e, json!({"cdp_endpoint": url, "recipe": recipe.clone(), "duration_ms": 30000})).unwrap();
     let envelope = v["result"]["fingerprint"]["mixer_envelope"].as_array().cloned().unwrap_or_default();
-    // The declared 0→2000 ms trajectory is resampled to the uniform 10 Hz grid the curve is
+    // The declared 0→2000 ms trajectory is resampled to the even 100 ms grid the curve is
     // scheduled on, and the fingerprint records exactly those grid times.
     assert_eq!(envelope.len(), 21, "{}", v["result"]);
     assert_eq!(envelope[0]["layer_id"], "pad");
@@ -1903,9 +1903,9 @@ fn offline_render_schedules_layer_envelopes_and_fingerprints_them() {
 
 #[test]
 fn offline_envelope_is_a_uniform_grid_of_the_declared_trajectory() {
-    // The declared breakpoints (350 ms peak) are resampled onto the uniform 100 ms grid the curve
-    // is actually scheduled on, so a mid-trajectory change is neither moved to the end nor
-    // recorded at a time the render never played.
+    // The declared breakpoints (350 ms peak) are resampled onto the even grid the curve is
+    // actually scheduled on (5 points, 350/4 = 87.5 ms apart), so a mid-trajectory change is
+    // neither moved to the end nor recorded at a time the render never played.
     let (url, _) = fake_cdp_with_eval(offline_report());
     let e = Engine::new(crate::testing::session());
     let recipe = json!({
@@ -1929,6 +1929,88 @@ fn offline_envelope_is_a_uniform_grid_of_the_declared_trajectory() {
     assert!((gain_at(300) - 6.0 / 7.0).abs() < 1e-4, "300 ms is 6/7 of the way to the 350 ms peak: {}", gain_at(300));
     assert!((gain_at(400) - (1.0 - 0.5 * 50.0 / 650.0)).abs() < 1e-4, "400 ms is just past the peak: {}", gain_at(400));
     assert!((gain_at(1000) - 0.5).abs() < 1e-6, "the last declared point is the last scheduled point: {}", gain_at(1000));
+}
+
+#[test]
+fn offline_render_fits_long_envelopes_on_many_layers_within_the_fingerprint_budget() {
+    // 5 layers × 120 s at the 100 ms target is 5×1201 readings, more than the fingerprint keeps
+    // (6000). A legal render must not be refused: the layer share adapts its grid instead.
+    let (url, _) = fake_cdp_with_eval(offline_report());
+    let e = Engine::new(crate::testing::session());
+    let layers: Vec<Value> = (0..5)
+        .map(|index| {
+            json!({
+                "id": format!("layer_{index}"),
+                "kind": "oscillator",
+                "wave": "sine",
+                "envelope": [
+                    {"t_ms": 0, "gain": 0.0, "pan": 0.0},
+                    {"t_ms": 120_000, "gain": 0.5, "pan": 0.0}
+                ]
+            })
+        })
+        .collect();
+    let v = offline_call(&e, json!({"cdp_endpoint": url, "recipe": {"version": 1, "layers": layers}, "duration_ms": 120_000})).unwrap();
+    let envelope = v["result"]["fingerprint"]["mixer_envelope"].as_array().cloned().unwrap_or_default();
+    assert_eq!(envelope.len(), 6000, "the five layers share the fingerprint's 6000 readings: {}", v["result"]);
+    for index in 0..5 {
+        let layer = format!("layer_{index}");
+        let times: Vec<u64> = envelope.iter().filter(|point| point["layer_id"] == layer).filter_map(|point| point["t_ms"].as_u64()).collect();
+        assert_eq!(times.len(), 1200, "{layer} gets an equal share of the budget");
+        assert_eq!(times.first().copied(), Some(0), "{layer} starts at 0 ms");
+        assert_eq!(times.last().copied(), Some(120_000), "{layer} ends at its declared span");
+    }
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(codes.contains(&"envelope_resampled"), "{codes:?}");
+}
+
+#[test]
+fn offline_render_fits_ten_sixty_second_envelopes() {
+    // 10 layers × 60 s at the 100 ms target is 6010 readings: also over the budget, also legal.
+    let (url, _) = fake_cdp_with_eval(offline_report());
+    let e = Engine::new(crate::testing::session());
+    let layers: Vec<Value> = (0..10)
+        .map(|index| {
+            json!({
+                "id": format!("layer_{index}"),
+                "kind": "oscillator",
+                "wave": "sine",
+                "envelope": [
+                    {"t_ms": 0, "gain": 0.0, "pan": 0.0},
+                    {"t_ms": 60_000, "gain": 0.5, "pan": 0.0}
+                ]
+            })
+        })
+        .collect();
+    let v = offline_call(&e, json!({"cdp_endpoint": url, "recipe": {"version": 1, "layers": layers}, "duration_ms": 60_000})).unwrap();
+    let envelope = v["result"]["fingerprint"]["mixer_envelope"].as_array().cloned().unwrap_or_default();
+    assert_eq!(envelope.len(), 6000, "{}", envelope.len());
+}
+
+#[test]
+fn offline_envelope_grid_records_the_spacing_the_curve_uses() {
+    // The even spacing is last / (points - 1), so a 350 ms envelope has 5 points 87.5 ms apart;
+    // the recorded times are those positions rounded to the nearest millisecond.
+    let (url, _) = fake_cdp_with_eval(offline_report());
+    let e = Engine::new(crate::testing::session());
+    let recipe = json!({
+        "version": 1,
+        "layers": [{
+            "id": "pad",
+            "kind": "oscillator",
+            "wave": "sine",
+            "envelope": [
+                {"t_ms": 0, "gain": 0.0, "pan": 0.0},
+                {"t_ms": 350, "gain": 1.0, "pan": 0.0}
+            ]
+        }]
+    });
+    let v = offline_call(&e, json!({"cdp_endpoint": url, "recipe": recipe, "duration_ms": 3000})).unwrap();
+    let envelope = v["result"]["fingerprint"]["mixer_envelope"].as_array().cloned().unwrap_or_default();
+    let times: Vec<u64> = envelope.iter().filter_map(|point| point["t_ms"].as_u64()).collect();
+    assert_eq!(times, vec![0, 88, 175, 263, 350], "{}", v["result"]);
+    let gain_at_88 = envelope[1]["gain"].as_f64().unwrap_or(f64::NAN);
+    assert!((gain_at_88 - 88.0 / 350.0).abs() < 1e-4, "{gain_at_88}");
 }
 
 #[test]
