@@ -1411,7 +1411,13 @@ fn capture_without_audio_context_is_typed_error() {
     let e = Engine::new(crate::testing::session());
     let err = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000})).unwrap_err();
     assert_eq!(err.code, ErrorCode::FeatureMissing, "{}", err.message);
-    assert!(err.remediation.as_deref().unwrap_or_default().contains("no AudioContext"), "{:?}", err.remediation);
+    // The remediation covers both reasons for a null reply: audio that hasn't started, and a
+    // playing page whose context is not reachable on window (seen live on Endel: no AudioContext
+    // among its 1267 window properties while it was Generating/Focus).
+    let remediation = err.remediation.as_deref().unwrap_or_default();
+    assert!(remediation.contains("no AudioContext"), "{remediation:?}");
+    assert!(remediation.contains("out of reach"), "{remediation:?}");
+    assert!(remediation.contains("__craftAnythingAudioContext"), "{remediation:?}");
     assert_eq!(err.details.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("no_audio_graph"));
 }
 
