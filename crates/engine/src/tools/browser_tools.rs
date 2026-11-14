@@ -2227,6 +2227,8 @@ fn web_audio_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
             "traced_ms": trace.traced_ms,
             "truncated": trace.truncated,
             "aborted": trace.aborted,
+            "dropped": trace.dropped,
+            "defaulted_params": {"gain": trace.defaulted_gain, "pan": trace.defaulted_pan},
         },
         "network_outline": network_outline,
         "sample_rate": sample_rate,
@@ -2284,7 +2286,26 @@ fn web_audio_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
         if trace.truncated {
             builder = builder.limitation(Limitation::new(
                 "envelope_truncated",
-                "The trace hit its cap (6000 readings or 60 seconds); later mixer movement is not in the envelope.",
+                "The trace hit its cap (6000 readings or 60 seconds) or lost unreadable rows; the envelope is not complete.",
+            ));
+        }
+        if trace.dropped > 0 {
+            builder = builder.limitation(Limitation::new(
+                "envelope_rows_dropped",
+                format!("{} of the page's mixer reading(s) were unreadable and were dropped; the envelope covers the rest.", trace.dropped),
+            ));
+        }
+        if trace.unreadable {
+            builder = builder
+                .limitation(Limitation::new("trace_unreadable", "The page's trace report carried no readable sample list, so no mixer envelope was recorded."));
+        }
+        if trace.defaulted_gain > 0 || trace.defaulted_pan > 0 {
+            builder = builder.limitation(Limitation::new(
+                "envelope_defaulted_params",
+                format!(
+                    "For {} layer(s) the page exposed no gain and for {} no pan; a missing gain is recorded as unity and a missing pan as centre, not as a measurement.",
+                    trace.defaulted_gain, trace.defaulted_pan
+                ),
             ));
         }
         if let Some(aborted) = &trace.aborted {
@@ -2301,7 +2322,7 @@ fn web_audio_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
         }
         builder = builder.limitation(Limitation::new(
             "layer_ids_from_page",
-            "Layers are named by the page's `__layerId` when it sets one, or by discovery order otherwise; a rebuild must use the same names to compare trajectories.",
+            "Layers are named by the page's `__layerId` when it sets one, or by discovery order otherwise; declare `__layerId` so a rebuild can line the trajectories up.",
         ));
     } else {
         builder = builder.limitation(Limitation::new(
@@ -2379,6 +2400,9 @@ const AUDIO_CAPTURE_SCRIPT: &str = r#"
     const prior = window.__craftAnythingAudioGraph;
     const state = prior && prior.nodes instanceof Set && Array.isArray(prior.edges) ? prior : { nodes: new Set(), edges: [], truncated: false };
     state.kindOf = kindOf;
+    // Node identity links (which node feeds which), so the interaction sampler can treat a
+    // gain and its panner as one mixer layer instead of inventing two.
+    if (!Array.isArray(state.links)) state.links = [];
     const record = (node) => {
       try { if (node && state.nodes.size < MAX_NODES) state.nodes.add(node); } catch (error) {}
       return node;
@@ -2404,6 +2428,10 @@ const AUDIO_CAPTURE_SCRIPT: &str = r#"
               state.edges.push({ from: kindOf(this), to: isParam ? 'AudioParam' : kindOf(destination), kind: isParam ? 'param' : 'audio' });
             } else {
               state.truncated = true;
+            }
+            if (!isParam && destination) {
+              if (state.links.length < MAX_EDGES) state.links.push([this, destination]);
+              else state.truncated = true;
             }
             record(this);
             if (!isParam) record(destination);
@@ -2609,18 +2637,67 @@ struct TraceRun {
     envelope: Vec<EnvelopeSample>,
     /// How long the page sampler ran, in milliseconds.
     traced_ms: u64,
-    /// Whether a cap (6000 readings or 60 seconds) stopped the trace early.
+    /// Whether a cap (6000 readings or 60 seconds) or an unreadable row stopped the trace early.
     truncated: bool,
     /// Whether the sampler started at all (the page had an observable audio graph).
     started: bool,
     /// Why the trace stopped short of its scripted steps, if it did.
     aborted: Option<String>,
+    /// Rows the page returned that no reading could be read from.
+    dropped: usize,
+    /// Layers whose gain was not observable and was recorded as unity.
+    defaulted_gain: u64,
+    /// Layers whose pan was not observable and was recorded as centre.
+    defaulted_pan: u64,
+    /// Whether the page's trace report was not a sample list at all.
+    unreadable: bool,
 }
 
 impl TraceRun {
     fn untraced() -> Self {
-        TraceRun { envelope: Vec::new(), traced_ms: 0, truncated: false, started: false, aborted: None }
+        TraceRun {
+            envelope: Vec::new(),
+            traced_ms: 0,
+            truncated: false,
+            started: false,
+            aborted: None,
+            dropped: 0,
+            defaulted_gain: 0,
+            defaulted_pan: 0,
+            unreadable: false,
+        }
     }
+}
+
+/// The valid readings from a sampler report, plus what could not be read.
+struct TraceRows {
+    envelope: Vec<EnvelopeSample>,
+    /// Rows that were not a `{t_ms, layer_id, gain, pan}` reading.
+    dropped: usize,
+    /// Valid readings beyond the 6000-sample cap.
+    beyond_cap: usize,
+    /// Whether the report carried no sample list at all.
+    unreadable: bool,
+}
+
+/// Read the sampler's rows one at a time: a malformed row is counted, never allowed to erase the
+/// whole trace. A missing or non-list `samples` is `unreadable`, so the caller can say why rather
+/// than reporting an empty trace as a successful one.
+fn parse_trace_rows(samples: Value) -> TraceRows {
+    let Some(rows) = samples.as_array() else {
+        return TraceRows { envelope: Vec::new(), dropped: 0, beyond_cap: 0, unreadable: true };
+    };
+    let mut envelope = Vec::with_capacity(rows.len().min(MAX_TRACE_SAMPLES));
+    let mut dropped = 0usize;
+    let mut beyond_cap = 0usize;
+    for row in rows {
+        match serde_json::from_value::<MixerSample>(row.clone()) {
+            Ok(sample) if envelope.len() < MAX_TRACE_SAMPLES => envelope.push(EnvelopeSample::from(sample)),
+            Ok(_) => beyond_cap += 1,
+            Err(_) => dropped += 1,
+        }
+    }
+    TraceRows { envelope, dropped, beyond_cap, unreadable: false }
 }
 
 /// Start the 10 Hz page sampler, run the scripted steps, then collect the traced gain/pan
@@ -2669,10 +2746,16 @@ fn run_interaction_trace(client: &mut CdpClient, p: &CaptureAudioParams, secrets
             let value = reply.get("result").and_then(|result| result.get("value")).cloned().unwrap_or(Value::Null);
             run.traced_ms = value.get("traced_ms").and_then(Value::as_u64).unwrap_or(0).min(MAX_TRACE_MS);
             run.truncated = value.get("truncated").and_then(Value::as_bool).unwrap_or(false);
-            let samples = value.get("samples").cloned().unwrap_or_else(|| json!([]));
-            let rows: Vec<MixerSample> = serde_json::from_value(samples).unwrap_or_default();
-            run.truncated |= rows.len() > MAX_TRACE_SAMPLES;
-            run.envelope = rows.into_iter().take(MAX_TRACE_SAMPLES).map(EnvelopeSample::from).collect();
+            run.defaulted_gain = value.get("defaulted_gain").and_then(Value::as_u64).unwrap_or(0);
+            run.defaulted_pan = value.get("defaulted_pan").and_then(Value::as_u64).unwrap_or(0);
+            let rows = parse_trace_rows(value.get("samples").cloned().unwrap_or(Value::Null));
+            run.unreadable = rows.unreadable;
+            run.dropped = rows.dropped;
+            run.truncated |= rows.dropped > 0 || rows.beyond_cap > 0;
+            run.envelope = rows.envelope;
+            if run.unreadable {
+                run.aborted.get_or_insert_with(|| "the trace report is unreadable (no sample list)".into());
+            }
         }
         Err(error) => {
             run.aborted.get_or_insert_with(|| format!("the trace could not be collected: {}", error.message));
@@ -2683,8 +2766,10 @@ fn run_interaction_trace(client: &mut CdpClient, p: &CaptureAudioParams, secrets
 
 /// Start sampling every tracked layer's gain and pan at 10 Hz into `window.__craftAnythingMixerTrace`.
 /// Layer ids are assigned once per node (a `WeakMap`) so the same layer keeps its name across polls,
-/// including nodes the page created after the capture's instrumentation. Bounded to 6000 readings
-/// and 60 seconds; returns immediately so scripted steps can run while it polls.
+/// including nodes the page created after the capture's instrumentation. A panner fed by a gain is
+/// folded into that gain's layer (identity links recorded by the capture script), and a missing gain
+/// or pan is filled with unity/centre but counted, so the result can name the default. Bounded to
+/// 6000 readings and 60 seconds; returns immediately so scripted steps can run while it polls.
 const AUDIO_TRACE_START_SCRIPT: &str = r#"
 (() => { // __craftAnythingTraceStart
   const MAX_SAMPLES = 6000, MAX_MS = 60000, MAX_LAYERS = 64, PERIOD_MS = __TRACE_PERIOD_MS__;
@@ -2702,19 +2787,54 @@ const AUDIO_TRACE_START_SCRIPT: &str = r#"
     if (!id) { id = 'layer_' + next; next += 1; ids.set(node, id); }
     return id;
   };
-  const trace = { samples: [], started: performance.now(), truncated: false, timer: 0 };
+  const paramOf = (node, name) => {
+    try {
+      const param = node ? node[name] : null;
+      return param && typeof param.value === 'number' && isFinite(param.value) ? param.value : null;
+    } catch (error) { return null; }
+  };
+  const trace = { samples: [], started: performance.now(), truncated: false, timer: 0, defaulted_gain: new Set(), defaulted_pan: new Set() };
   const poll = () => {
     const elapsed = performance.now() - trace.started;
     if (elapsed >= MAX_MS) { trace.truncated = true; clearInterval(trace.timer); return; }
+    // Pair each gain with an adjacent pan-only panner (either direction), so one mixer layer is
+    // one reading. The capture script recorded identity links for every connection (read afresh
+    // each poll, so a layer the steps create is paired too); older tracker state has none.
+    const links = Array.isArray(state.links) ? state.links : [];
+    const downstreamPan = new Map(), upstreamPan = new Map(), absorbed = new Set();
+    for (const link of links) {
+      if (!Array.isArray(link)) continue;
+      const from = link[0], to = link[1];
+      if (!from || !to) continue;
+      const fromGain = paramOf(from, 'gain'), fromPan = paramOf(from, 'pan');
+      const toGain = paramOf(to, 'gain'), toPan = paramOf(to, 'pan');
+      if (fromGain !== null && toPan !== null && toGain === null) {
+        downstreamPan.set(from, to);
+        absorbed.add(to);
+      } else if (fromPan !== null && fromGain === null && toGain !== null) {
+        upstreamPan.set(to, from);
+        absorbed.add(from);
+      }
+    }
     let layers = 0;
     for (const node of state.nodes) {
+      const ownGain = paramOf(node, 'gain');
+      const ownPan = paramOf(node, 'pan');
+      if (ownGain === null && ownPan === null) continue;
+      // A panner paired with a gain belongs to that gain's layer; the gain emits the reading.
+      if (ownGain === null && absorbed.has(node)) continue;
       if (layers >= MAX_LAYERS) { trace.truncated = true; break; }
-      const gain = node && node.gain && typeof node.gain.value === 'number' ? node.gain.value : null;
-      const pan = node && node.pan && typeof node.pan.value === 'number' ? node.pan.value : null;
-      if (gain === null && pan === null) continue;
       layers += 1;
       if (trace.samples.length >= MAX_SAMPLES) { trace.truncated = true; break; }
-      trace.samples.push({ t_ms: Math.round(elapsed), layer_id: nameOf(node), gain: gain === null ? 1 : gain, pan: pan === null ? 0 : pan });
+      const id = nameOf(node);
+      let gain = ownGain, pan = ownPan;
+      if (gain === null) { gain = 1; trace.defaulted_gain.add(id); }
+      if (pan === null) {
+        const panner = downstreamPan.get(node) || upstreamPan.get(node);
+        const observed = panner ? paramOf(panner, 'pan') : null;
+        if (observed === null) { pan = 0; trace.defaulted_pan.add(id); } else { pan = observed; }
+      }
+      trace.samples.push({ t_ms: Math.round(elapsed), layer_id: id, gain: gain, pan: pan });
     }
   };
   poll();
@@ -2724,17 +2844,19 @@ const AUDIO_TRACE_START_SCRIPT: &str = r#"
 })()
 "#;
 
-/// Stop the sampler and return its readings, bounded once more on the way out.
+/// Stop the sampler and return its readings and default counts, bounded once more on the way out.
 const AUDIO_TRACE_STOP_SCRIPT: &str = r#"
 (() => { // __craftAnythingTraceStop
   const trace = window.__craftAnythingMixerTrace;
-  if (!trace) return { samples: [], truncated: false, traced_ms: 0 };
+  if (!trace) return { samples: [], truncated: false, traced_ms: 0, defaulted_gain: 0, defaulted_pan: 0 };
   if (trace.timer) clearInterval(trace.timer);
   const samples = Array.isArray(trace.samples) ? trace.samples : [];
   return {
     samples: samples.slice(0, 6000),
     truncated: !!trace.truncated || samples.length > 6000,
-    traced_ms: Math.round(performance.now() - trace.started)
+    traced_ms: Math.round(performance.now() - trace.started),
+    defaulted_gain: trace.defaulted_gain instanceof Set ? trace.defaulted_gain.size : 0,
+    defaulted_pan: trace.defaulted_pan instanceof Set ? trace.defaulted_pan.size : 0
   };
 })()
 "#;
@@ -2836,6 +2958,9 @@ const OFFLINE_FILTERS: &[&str] = &["lowpass", "highpass", "bandpass", "notch", "
 const MAX_OFFLINE_ENVELOPE: usize = 6_000;
 /// Most gain/pan points a whole recipe's envelopes may hold.
 const MAX_OFFLINE_ENVELOPE_TOTAL: usize = 6_000;
+/// The uniform grid an offline envelope is resampled to, in milliseconds, so the curve
+/// `setValueCurveAtTime` spreads evenly matches the times the fingerprint records.
+const OFFLINE_ENVELOPE_STEP_MS: u64 = 100;
 
 /// The audio scene to rebuild: a version, the scenario it stands for, and its layers.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -3006,7 +3131,7 @@ fn web_audio_offline_render(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutp
         )
         .with_remediation("Render a shorter window or a lower sample rate."));
     }
-    let plan = offline_recipe_plan(&p.recipe)?;
+    let plan = offline_recipe_plan(&p.recipe, p.duration_ms)?;
     let expression = offline_render_script(&plan, p.duration_ms, p.sample_rate)?;
 
     let dl = deadline(ctx, p.timeout_secs)?;
@@ -3133,6 +3258,10 @@ fn web_audio_offline_render(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutp
             "envelope_from_recipe",
             "The mixer envelope is the recipe's scheduled gain/pan trajectory, not an observed one: it shows what the rebuild was told to do.",
         ));
+        builder = builder.limitation(Limitation::new(
+            "envelope_resampled",
+            "The declared envelope is resampled to a uniform 10 Hz grid, because a value curve spreads its points evenly; the fingerprint records those grid times, which are what played.",
+        ));
     } else {
         builder = builder.limitation(Limitation::new(
             "no_interaction_trace",
@@ -3152,8 +3281,10 @@ fn web_audio_offline_render(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutp
     Ok(ToolOutput::evidence(builder.build()?))
 }
 
-/// Validate the recipe and turn it into the bounded object the page script embeds.
-fn offline_recipe_plan(recipe: &OfflineRecipe) -> Result<Value, ToolError> {
+/// Validate the recipe and turn it into the bounded object the page script embeds. `duration_ms`
+/// bounds every envelope point: a trajectory that runs past the render cannot be scheduled as
+/// written, so it is refused rather than silently cut.
+fn offline_recipe_plan(recipe: &OfflineRecipe, duration_ms: u64) -> Result<Value, ToolError> {
     if recipe.version != OFFLINE_RECIPE_VERSION {
         return Err(ToolError::invalid(format!(
             "audio recipe version {} is not supported; this build renders version {OFFLINE_RECIPE_VERSION}",
@@ -3181,7 +3312,7 @@ fn offline_recipe_plan(recipe: &OfflineRecipe) -> Result<Value, ToolError> {
         let pan = checked_offline_range(&format!("layers[{index}].pan"), layer.pan, -1.0, 1.0)?;
         let id: String = layer.id.as_deref().unwrap_or("").chars().take(64).collect();
         let id = if id.is_empty() { format!("layer_{index}") } else { id };
-        let envelope = offline_envelope_points(&format!("layers[{index}].envelope"), layer.envelope.as_deref())?;
+        let envelope = offline_envelope_points(&format!("layers[{index}].envelope"), layer.envelope.as_deref(), duration_ms)?;
         envelope_total = envelope_total.saturating_add(envelope.len());
         if envelope_total > MAX_OFFLINE_ENVELOPE_TOTAL {
             return Err(ToolError::new(
@@ -3214,10 +3345,14 @@ fn offline_recipe_plan(recipe: &OfflineRecipe) -> Result<Value, ToolError> {
     Ok(json!({"version": OFFLINE_RECIPE_VERSION, "scenario_id": scenario_id, "layers": layers}))
 }
 
-/// Validate one layer's gain/pan trajectory and bound it: at least two points, non-decreasing
-/// times, each gain 0..=2 and pan -1..=1, and at most [`MAX_OFFLINE_ENVELOPE`] points. Layers
-/// without an envelope become an empty list.
-fn offline_envelope_points(name: &str, points: Option<&[OfflineEnvelopePoint]>) -> Result<Vec<Value>, ToolError> {
+/// Validate one layer's gain/pan trajectory, then resample it to the uniform grid
+/// [`OFFLINE_ENVELOPE_STEP_MS`] on which `setValueCurveAtTime` spreads its values. Requiring at
+/// least two points, non-decreasing times, gain 0..=2, pan -1..=1, no point past `duration_ms`,
+/// and at most [`MAX_OFFLINE_ENVELOPE`] points. Layers without an envelope become an empty list.
+///
+/// Resampling is what makes the fingerprint honest: the scheduled curve honours every point on
+/// this grid, so the recorded `t_ms` values are the ones the render actually played.
+fn offline_envelope_points(name: &str, points: Option<&[OfflineEnvelopePoint]>, duration_ms: u64) -> Result<Vec<Value>, ToolError> {
     let Some(points) = points.filter(|points| !points.is_empty()) else { return Ok(Vec::new()) };
     if points.len() > MAX_OFFLINE_ENVELOPE {
         return Err(ToolError::new(ErrorCode::OverLimit, format!("{name} holds {} points; at most {MAX_OFFLINE_ENVELOPE} are rendered", points.len()))
@@ -3227,21 +3362,59 @@ fn offline_envelope_points(name: &str, points: Option<&[OfflineEnvelopePoint]>) 
         return Err(ToolError::invalid(format!("{name} needs at least two points; a single point has no trajectory"))
             .with_remediation("Add a second {t_ms, gain, pan} point, or omit the envelope and set the layer's gain and pan."));
     }
-    let mut out = Vec::with_capacity(points.len());
+    let mut declared: Vec<(u64, f64, f64)> = Vec::with_capacity(points.len());
     let mut previous = 0u64;
     for (at, point) in points.iter().enumerate() {
         if at > 0 && point.t_ms < previous {
             return Err(ToolError::invalid(format!("{name}[{at}].t_ms is {} but the point before it is at {previous} ms", point.t_ms))
                 .with_remediation("Order the envelope's points by time, earliest first."));
         }
+        if point.t_ms > duration_ms {
+            return Err(ToolError::invalid(format!("{name}[{at}].t_ms is {} ms but the render is only {duration_ms} ms", point.t_ms))
+                .with_remediation("Render at least as long as the envelope's last point, or shorten the trajectory."));
+        }
         previous = point.t_ms;
-        out.push(json!({
-            "t_ms": point.t_ms,
-            "gain": checked_offline_range(&format!("{name}[{at}].gain"), point.gain, 0.0, 2.0)?,
-            "pan": checked_offline_range(&format!("{name}[{at}].pan"), point.pan, -1.0, 1.0)?,
-        }));
+        declared.push((
+            point.t_ms,
+            checked_offline_range(&format!("{name}[{at}].gain"), point.gain, 0.0, 2.0)?,
+            checked_offline_range(&format!("{name}[{at}].pan"), point.pan, -1.0, 1.0)?,
+        ));
+    }
+    let last = declared.last().map(|point| point.0).unwrap_or(0);
+    if last == 0 {
+        return Err(ToolError::invalid(format!("{name} ends at 0 ms; a trajectory needs time to play"))
+            .with_remediation("Move the last point to at least a millisecond after the first."));
+    }
+    let span = last.div_ceil(OFFLINE_ENVELOPE_STEP_MS).saturating_add(1).min(MAX_OFFLINE_ENVELOPE as u64).max(2);
+    let mut out = Vec::with_capacity(usize::try_from(span).unwrap_or(MAX_OFFLINE_ENVELOPE));
+    for index in 0..span {
+        let at = ((index as f64) * (last as f64) / ((span - 1) as f64)).round() as u64;
+        let (gain, pan) = interpolate_envelope(&declared, at);
+        out.push(json!({"t_ms": at.min(last), "gain": gain, "pan": pan}));
     }
     Ok(out)
+}
+
+/// Linear interpolation of a validated, time-ordered envelope at `at`; past either end the nearest
+/// declared point wins.
+fn interpolate_envelope(points: &[(u64, f64, f64)], at: u64) -> (f64, f64) {
+    let Some(&first) = points.first() else { return (0.0, 0.0) };
+    let mut left = first;
+    for &right in points {
+        if right.0 == at {
+            return (right.1, right.2);
+        }
+        if right.0 > at {
+            let span = (right.0 - left.0) as f64;
+            if span <= 0.0 {
+                return (right.1, right.2);
+            }
+            let along = (at.saturating_sub(left.0)) as f64 / span;
+            return (left.1 + (right.1 - left.1) * along, left.2 + (right.2 - left.2) * along);
+        }
+        left = right;
+    }
+    (left.1, left.2)
 }
 
 /// The scheduled gain/pan trajectory of a validated recipe, as fingerprint samples.

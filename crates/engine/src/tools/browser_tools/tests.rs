@@ -30,6 +30,16 @@ fn fake_cdp_with_eval(value: Value) -> (String, Arc<AtomicBool>) {
 /// As [`fake_cdp_with_eval`], but the browser refuses `failing` methods with a CDP error (what a
 /// browser without that domain does), so a tool's "unavailable" path can be exercised.
 fn fake_cdp_with_eval_and_failing(value: Value, failing: &[&str]) -> (String, Arc<AtomicBool>) {
+    fake_cdp_full(value, failing, None)
+}
+
+/// As [`fake_cdp_with_eval`], but the interaction-trace collector answers with `trace` (the raw
+/// sampler report), so a malformed or counted-drop trace can be exercised.
+fn fake_cdp_with_trace(value: Value, trace: Value) -> (String, Arc<AtomicBool>) {
+    fake_cdp_full(value, &[], Some(trace))
+}
+
+fn fake_cdp_full(value: Value, failing: &[&str], trace: Option<Value>) -> (String, Arc<AtomicBool>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let url = format!("http://127.0.0.1:{port}");
@@ -37,13 +47,15 @@ fn fake_cdp_with_eval_and_failing(value: Value, failing: &[&str]) -> (String, Ar
     let ws_seen2 = ws_seen.clone();
     let eval = Arc::new(value);
     let failing: Arc<Vec<String>> = Arc::new(failing.iter().map(|method| (*method).to_string()).collect());
+    let trace = trace.map(Arc::new);
     std::thread::spawn(move || {
         for s in listener.incoming() {
             let Ok(stream) = s else { break };
             let seen = ws_seen2.clone();
             let eval = eval.clone();
             let failing = failing.clone();
-            std::thread::spawn(move || serve(stream, port, seen, eval, failing));
+            let trace = trace.clone();
+            std::thread::spawn(move || serve(stream, port, seen, eval, failing, trace));
         }
     });
     (url, ws_seen)
@@ -132,7 +144,7 @@ fn serve_hanging(mut stream: TcpStream, port: u16, hanging: Arc<Vec<String>>) {
     let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 }
 
-fn serve(mut stream: TcpStream, port: u16, ws_seen: Arc<AtomicBool>, eval: Arc<Value>, failing: Arc<Vec<String>>) {
+fn serve(mut stream: TcpStream, port: u16, ws_seen: Arc<AtomicBool>, eval: Arc<Value>, failing: Arc<Vec<String>>, trace: Option<Arc<Value>>) {
     let (request_line, headers) = read_headers(&mut stream);
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
     if path.starts_with("/json/version") {
@@ -160,7 +172,7 @@ fn serve(mut stream: TcpStream, port: u16, ws_seen: Arc<AtomicBool>, eval: Arc<V
         let accept = ws_accept(&key);
         let resp = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n");
         let _ = stream.write_all(resp.as_bytes());
-        serve_ws(&mut stream, &eval, &failing);
+        serve_ws(&mut stream, &eval, &failing, trace.as_deref());
         ws_seen.store(true, Ordering::Relaxed);
         return;
     }
@@ -227,7 +239,7 @@ fn ws_write(stream: &mut TcpStream, text: &str) {
     let _ = stream.write_all(&frame);
 }
 
-fn serve_ws(stream: &mut TcpStream, eval: &Value, failing: &[String]) {
+fn serve_ws(stream: &mut TcpStream, eval: &Value, failing: &[String], trace: Option<&Value>) {
     let bundle = craft_anything_testkit::electron::WEBPACK_BUNDLE;
     while let Some(msg) = ws_read(stream) {
         let req: Value = match serde_json::from_str(&msg) {
@@ -281,20 +293,24 @@ fn serve_ws(stream: &mut TcpStream, eval: &Value, failing: &[String]) {
             "Network.getCookies" => json!({"cookies": [{"name": "sid", "value": "cookie-VALUE"}]}),
             // The audio capture's introspection script; the test decides what the page reports.
             // The interaction-trace scripts are recognised by their markers: the tracer starts,
-            // the collector returns the two readings a 10 Hz poll would have taken.
+            // the collector returns the two readings a 10 Hz poll would have taken (or whatever
+            // raw sampler report the test supplies).
             "Runtime.evaluate" => {
                 let expression = req.pointer("/params/expression").and_then(Value::as_str).unwrap_or_default();
                 if expression.contains("__craftAnythingTraceStart") {
                     json!({"result": {"value": {"started": true, "layers": 1}}})
                 } else if expression.contains("__craftAnythingTraceStop") {
-                    json!({"result": {"value": {
-                        "samples": [
-                            {"t_ms": 0, "layer_id": "pad", "gain": 0.0, "pan": 0.0},
-                            {"t_ms": 200, "layer_id": "pad", "gain": 1.0, "pan": 0.0}
-                        ],
-                        "truncated": false,
-                        "traced_ms": 200
-                    }}})
+                    let value = trace.cloned().unwrap_or_else(|| {
+                        json!({
+                            "samples": [
+                                {"t_ms": 0, "layer_id": "pad", "gain": 0.0, "pan": 0.0},
+                                {"t_ms": 200, "layer_id": "pad", "gain": 1.0, "pan": 0.0}
+                            ],
+                            "truncated": false,
+                            "traced_ms": 200
+                        })
+                    });
+                    json!({"result": {"value": value}})
                 } else {
                     json!({"result": {"value": eval.clone()}})
                 }
@@ -1565,6 +1581,92 @@ fn capture_refuses_too_many_interaction_steps() {
     assert!(err.message.contains("steps"), "{}", err.message);
 }
 
+#[test]
+fn capture_names_params_the_trace_had_to_default() {
+    // A layer that only exposes .pan has no observed gain (the page never declared one), so the
+    // sampler records unity and counts the default instead of passing it off as measured.
+    let (url, _) = fake_cdp_with_trace(
+        audio_report(),
+        json!({
+            "samples": [{"t_ms": 0, "layer_id": "pad", "gain": 0.2, "pan": -0.4}],
+            "truncated": false,
+            "traced_ms": 200,
+            "defaulted_gain": 1,
+            "defaulted_pan": 2
+        }),
+    );
+    let e = Engine::new(crate::testing::session());
+    let v = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000, "interaction_trace": true})).unwrap();
+    assert_eq!(v["result"]["interaction_trace"]["defaulted_params"]["gain"], 1);
+    assert_eq!(v["result"]["interaction_trace"]["defaulted_params"]["pan"], 2);
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(codes.contains(&"envelope_defaulted_params"), "{codes:?}");
+}
+
+#[test]
+fn trace_sampler_pairs_a_gain_with_its_panner() {
+    // Cheap shape guard: without a JS runtime the sampler's pairing is asserted by its parts. The
+    // capture script records identity links (which node feeds which), and the sampler folds a
+    // panner into the gain that feeds it instead of inventing a second layer.
+    assert!(super::AUDIO_CAPTURE_SCRIPT.contains("state.links.push([this, destination])"), "the instrumentation must record node identity links");
+    assert!(super::AUDIO_CAPTURE_SCRIPT.contains("Array.isArray(state.links)"), "an older tracker state must gain the link list");
+    let script = super::AUDIO_TRACE_START_SCRIPT;
+    assert!(script.contains("absorbed.has(node)"), "a paired panner must not become its own layer");
+    assert!(script.contains("downstreamPan.get(node) || upstreamPan.get(node)"), "a gain must adopt an adjacent panner's pan in either chain direction");
+    assert!(script.contains("defaulted_gain") && script.contains("defaulted_pan"), "fabricated defaults must be counted");
+}
+
+#[test]
+fn capture_counts_unreadable_trace_rows_instead_of_dropping_the_trace() {
+    let (url, _) = fake_cdp_with_trace(
+        audio_report(),
+        json!({
+            "samples": [
+                {"t_ms": 0, "layer_id": "pad", "gain": 0.0, "pan": 0.0},
+                {"t_ms": "soon", "layer_id": "pad", "gain": 1.0, "pan": 0.0},
+                {"layer_id": "pad", "gain": 0.5}
+            ],
+            "truncated": false,
+            "traced_ms": 200
+        }),
+    );
+    let e = Engine::new(crate::testing::session());
+    let v = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000, "interaction_trace": true})).unwrap();
+    assert_eq!(v["result"]["mixer_envelope"].as_array().map(Vec::len), Some(1), "the readable row survives: {}", v["result"]);
+    assert_eq!(v["result"]["interaction_trace"]["dropped"], 2);
+    assert_eq!(v["result"]["interaction_trace"]["truncated"], true, "dropped rows are disclosed as a bounded trace");
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(codes.contains(&"envelope_rows_dropped"), "{codes:?}");
+}
+
+#[test]
+fn capture_reports_an_unreadable_trace_instead_of_an_empty_one() {
+    let (url, _) = fake_cdp_with_trace(audio_report(), json!({"samples": "not a list", "traced_ms": 200}));
+    let e = Engine::new(crate::testing::session());
+    let v = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000, "interaction_trace": true})).unwrap();
+    assert_eq!(v["result"]["mixer_envelope"].as_array().map(Vec::len), Some(0));
+    let aborted = v["result"]["interaction_trace"]["aborted"].as_str().unwrap_or_default();
+    assert!(aborted.contains("unreadable"), "the reason must name the unreadable report: {aborted}");
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(codes.contains(&"trace_unreadable"), "{codes:?}");
+}
+
+#[test]
+fn trace_rows_keep_readable_rows_and_count_the_rest() {
+    let rows = super::parse_trace_rows(json!([
+        {"t_ms": 0, "layer_id": "pad", "gain": 0.0, "pan": 0.0},
+        {"t_ms": 1, "layer_id": "pad", "gain": 1.0, "pan": 0.0},
+        {"t_ms": 2, "layer_id": "pad", "gain": 0.5}
+    ]));
+    assert_eq!(rows.envelope.len(), 2, "the readable rows survive");
+    assert_eq!(rows.dropped, 1, "the incomplete row is counted, not silently swallowed");
+    assert!(!rows.unreadable);
+
+    let rows = super::parse_trace_rows(Value::Null);
+    assert!(rows.unreadable, "a missing report is named, not treated as an empty trace");
+    assert!(rows.envelope.is_empty());
+}
+
 // ---------------------------------------------------------------------------------------------
 // web_audio_offline_render (Deep-only, headless OfflineAudioContext)
 
@@ -1740,18 +1842,34 @@ fn offline_render_schedules_layer_envelopes_and_fingerprints_them() {
     });
     let v = offline_call(&e, json!({"cdp_endpoint": url, "recipe": recipe.clone(), "duration_ms": 30000})).unwrap();
     let envelope = v["result"]["fingerprint"]["mixer_envelope"].as_array().cloned().unwrap_or_default();
-    assert_eq!(envelope.len(), 2, "{}", v["result"]);
+    // The declared 0→2000 ms trajectory is resampled to the uniform 10 Hz grid the curve is
+    // scheduled on, and the fingerprint records exactly those grid times.
+    assert_eq!(envelope.len(), 21, "{}", v["result"]);
     assert_eq!(envelope[0]["layer_id"], "pad");
+    assert_eq!(envelope[0]["t_ms"], 0);
     assert_eq!(envelope[0]["gain"], 0.0);
-    assert_eq!(envelope[1]["gain"], 1.0);
-    assert!((envelope[1]["pan"].as_f64().unwrap_or(0.0) + 0.5).abs() < 1e-6);
+    assert_eq!(envelope[20]["t_ms"], 2000);
+    assert!((envelope[20]["gain"].as_f64().unwrap_or(0.0) - 1.0).abs() < 1e-6);
+    assert!((envelope[20]["pan"].as_f64().unwrap_or(0.0) + 0.5).abs() < 1e-6);
+    let times: Vec<u64> = envelope.iter().filter_map(|point| point["t_ms"].as_u64()).collect();
+    assert_eq!(times, (0..=20).map(|index| index * 100).collect::<Vec<u64>>(), "the recorded times are the scheduled grid");
     let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
     assert!(!codes.contains(&"no_interaction_trace"), "a recipe with envelopes is not untraced: {codes:?}");
+    assert!(codes.contains(&"envelope_resampled"), "the grid must be disclosed: {codes:?}");
 
     // The generated page script schedules the curve before startRendering(), for gain and pan.
     let parsed: super::OfflineRecipe = serde_json::from_value(recipe).unwrap();
-    let plan = super::offline_recipe_plan(&parsed).unwrap();
-    assert_eq!(plan["layers"][0]["envelope"].as_array().map(Vec::len), Some(2), "{plan}");
+    let plan = super::offline_recipe_plan(&parsed, 30_000).unwrap();
+    assert_eq!(plan["layers"][0]["envelope"].as_array().map(Vec::len), Some(21), "{plan}");
+    let planned = plan["layers"][0]["envelope"].as_array().cloned().unwrap_or_default();
+    let planned_times: Vec<u64> = planned.iter().filter_map(|point| point["t_ms"].as_u64()).collect();
+    assert_eq!(planned_times, times, "the fingerprint records the times the script schedules");
+    for (point, recorded) in planned.iter().zip(envelope.iter()) {
+        // The fingerprint stores f32 readings, so compare within float noise of the scheduled f64.
+        let near = |planned: &Value, recorded: &Value| (planned.as_f64().unwrap_or(f64::NAN) - recorded.as_f64().unwrap_or(f64::NAN)).abs() < 1e-6;
+        assert!(near(&point["gain"], &recorded["gain"]), "the fingerprint records the gain the script schedules: {} vs {}", point["gain"], recorded["gain"]);
+        assert!(near(&point["pan"], &recorded["pan"]), "the fingerprint records the pan the script schedules: {} vs {}", point["pan"], recorded["pan"]);
+    }
     let script = super::offline_render_script(&plan, 30_000, 48_000).unwrap();
     assert!(script.contains("setValueCurveAtTime"), "the curve must be scheduled");
     assert!(script.contains("gain.gain.setValueCurveAtTime"), "the gain trajectory must be scheduled");
@@ -1781,6 +1899,59 @@ fn offline_render_schedules_layer_envelopes_and_fingerprints_them() {
     assert_eq!(cmp["result"]["likeness_pass"], false, "{}", cmp["result"]);
     let same = call(&e, "web_audio_compare", json!({"before": rising.clone(), "after": rising})).unwrap();
     assert_eq!(same["result"]["likeness_pass"], true, "{}", same["result"]);
+}
+
+#[test]
+fn offline_envelope_is_a_uniform_grid_of_the_declared_trajectory() {
+    // The declared breakpoints (350 ms peak) are resampled onto the uniform 100 ms grid the curve
+    // is actually scheduled on, so a mid-trajectory change is neither moved to the end nor
+    // recorded at a time the render never played.
+    let (url, _) = fake_cdp_with_eval(offline_report());
+    let e = Engine::new(crate::testing::session());
+    let recipe = json!({
+        "version": 1,
+        "layers": [{
+            "id": "pad",
+            "kind": "oscillator",
+            "wave": "sine",
+            "envelope": [
+                {"t_ms": 0, "gain": 0.0, "pan": 0.0},
+                {"t_ms": 350, "gain": 1.0, "pan": -0.5},
+                {"t_ms": 1000, "gain": 0.5, "pan": 0.25}
+            ]
+        }]
+    });
+    let v = offline_call(&e, json!({"cdp_endpoint": url, "recipe": recipe, "duration_ms": 3000})).unwrap();
+    let envelope = v["result"]["fingerprint"]["mixer_envelope"].as_array().cloned().unwrap_or_default();
+    let times: Vec<u64> = envelope.iter().filter_map(|point| point["t_ms"].as_u64()).collect();
+    assert_eq!(times, (0..=10).map(|index| index * 100).collect::<Vec<u64>>(), "{}", v["result"]);
+    let gain_at = |at: u64| envelope.iter().find(|point| point["t_ms"].as_u64() == Some(at)).and_then(|point| point["gain"].as_f64()).unwrap_or(f64::NAN);
+    assert!((gain_at(300) - 6.0 / 7.0).abs() < 1e-4, "300 ms is 6/7 of the way to the 350 ms peak: {}", gain_at(300));
+    assert!((gain_at(400) - (1.0 - 0.5 * 50.0 / 650.0)).abs() < 1e-4, "400 ms is just past the peak: {}", gain_at(400));
+    assert!((gain_at(1000) - 0.5).abs() < 1e-6, "the last declared point is the last scheduled point: {}", gain_at(1000));
+}
+
+#[test]
+fn offline_render_refuses_envelope_points_past_the_render_end() {
+    let e = Engine::new(crate::testing::session());
+    let err = offline_call(
+        &e,
+        json!({
+            "cdp_endpoint": "http://127.0.0.1:9",
+            "recipe": {"version": 1, "layers": [{
+                "id": "pad",
+                "kind": "oscillator",
+                "envelope": [
+                    {"t_ms": 0, "gain": 0.0, "pan": 0.0},
+                    {"t_ms": 5000, "gain": 1.0, "pan": 0.0}
+                ]
+            }]},
+            "duration_ms": 1000
+        }),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadInput, "{}", err.message);
+    assert!(err.message.contains("5000") && err.message.contains("1000"), "{}", err.message);
 }
 
 #[test]
