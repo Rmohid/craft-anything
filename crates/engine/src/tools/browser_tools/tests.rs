@@ -1418,6 +1418,11 @@ fn capture_without_audio_context_is_typed_error() {
     assert!(remediation.contains("no AudioContext"), "{remediation:?}");
     assert!(remediation.contains("out of reach"), "{remediation:?}");
     assert!(remediation.contains("__craftAnythingAudioContext"), "{remediation:?}");
+    // An analyser alone is not enough: findContext() returns null before findAnalyser() runs.
+    assert!(!remediation.contains("context or analyser"), "{remediation:?}");
+    assert!(remediation.contains("__craftAnythingAudioContexts"), "{remediation:?}");
+    assert!(remediation.contains("context must be reachable first"), "{remediation:?}");
+    assert!(remediation.contains("tells the capture which node to read"), "{remediation:?}");
     assert_eq!(err.details.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("no_audio_graph"));
 }
 

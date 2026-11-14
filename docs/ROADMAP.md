@@ -2685,10 +2685,12 @@ Owner: open · Status: in progress
 - [ ] `web_audio_state_apply`: restore a captured mixer state (layer gains and pans) to a page,
       the inverse of the phase-2 interaction trace (`web_audio_capture` records `mixer_envelope`
       but nothing replays it yet).
-- [ ] See the graph of a page whose audio graph is already built: install the node-creation
-      wraps before looking for a context, so a page whose `AudioContext` is not on `window`
-      (module-scope, e.g. Endel's) still yields a non-empty graph from node creation during the
-      capture; the spectrum stays gated on an `AnalyserNode`.
+- [ ] See a page's whole audio graph from the first node: wrap the `AudioContext` constructor and
+      its node-creation methods from `Page.addScriptToEvaluateOnNewDocument`, before the page
+      builds its graph, so a context kept in module scope (e.g. Endel's) is captured and every
+      node it creates is recorded; the analyser is read from that context. A graph fully built
+      before the injection starts stays unrecoverable, and the capture must keep reporting the
+      empty graph rather than claiming coverage.
 - [ ] Persist `audio-fingerprint.json` beside the capture as the plan's storage shape requires:
       `web_audio_fingerprint` returns a v1 fingerprint as evidence but writes no file.
 - [ ] Make the fingerprint's log-bin shape robust to the page analyser's FFT size: a live-identical

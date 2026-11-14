@@ -2571,7 +2571,7 @@ fn parse_audio_capture_reply(reply: &Value) -> Result<Value, ToolError> {
     if value.is_null() {
         return Err(ToolError::new(ErrorCode::FeatureMissing, "the page has no AudioContext to listen to")
             .with_remediation(
-                "Start the page's audio and try again: the capture found no AudioContext on the page. A page that keeps its audio context out of reach (not on window) reads the same even while it plays; it must expose its context or analyser (window.__craftAnythingAudioContext / window.__craftAnythingAudioAnalyser) to be captured. If the sound plays in a cross-origin iframe, pass that frame's target_id.",
+                "Start the page's audio and try again: the capture found no AudioContext on the page. A page that keeps its audio context out of reach (not on window) reads the same even while it plays; it must expose its context on window (window.__craftAnythingAudioContext, or the __craftAnythingAudioContexts list, or a global named audioContext/ctx). Naming its analyser (window.__craftAnythingAudioAnalyser) tells the capture which node to read, but the context must be reachable first. If the sound plays in a cross-origin iframe, pass that frame's target_id.",
             )
             .with_details(json!({"reason": "no_audio_graph"})));
     }
