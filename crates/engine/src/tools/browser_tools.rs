@@ -2091,7 +2091,7 @@ fn web_audio_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
     // outlines the requests made while the capture listens.
     let _ = client.call("Runtime.enable", json!({}), None, &dl);
     let _ = client.call("Media.enable", json!({}), None, &dl);
-    let _ = client.call("Network.enable", json!({}), None, &dl);
+    let network_enabled = client.call("Network.enable", json!({}), None, &dl).is_ok();
 
     let reply = match client.call(
         "Runtime.evaluate",
@@ -2121,7 +2121,7 @@ fn web_audio_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
         Ok(capture) => capture,
         Err(error) => return cleanup_then_err(&mut client, &dl, error),
     };
-    let network_outline = audio_network_outline(&mut client, &mut secrets);
+    let network_outline = audio_network_outline(&mut client, &mut secrets, network_enabled);
     cleanup(&mut client, &dl);
 
     let page_url = secrets.text(&page_url);
@@ -2161,9 +2161,15 @@ fn web_audio_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
         "fft_size": fft_size,
         "samples": samples,
         "secrets_hidden": p.hidden_values.len(),
-        "secret_redactions": secrets.redactions,
+        "secret_redactions": 0,
     });
     let result = secrets.scrub(&result);
+    // Stamp the count after the scrub: scrubbing the page's graph and mixer state redacts values
+    // too, so a count taken while building the object would under-report.
+    let mut result = result;
+    if let Some(object) = result.as_object_mut() {
+        object.insert("secret_redactions".into(), json!(secrets.redactions));
+    }
 
     let mut builder = EvidenceBuilder::new(
         "web_audio_capture",
@@ -2491,8 +2497,12 @@ fn parse_audio_capture_reply(reply: &Value) -> Result<Value, ToolError> {
 
 /// An outline of the requests the page made while the capture listened: how many, their origins
 /// and a bounded endpoint list. Query values are dropped and declared secrets are redacted.
-fn audio_network_outline(client: &mut CdpClient, secrets: &mut Secrets) -> Value {
+///
+/// `enabled` is whether `Network.enable` succeeded; when it didn't, or when the event queue
+/// overflowed, the outline says so instead of looking like a page that made no requests.
+fn audio_network_outline(client: &mut CdpClient, secrets: &mut Secrets, enabled: bool) -> Value {
     use std::collections::{BTreeMap, BTreeSet};
+    let dropped = client.dropped_events();
     let events = client.take_events();
     let mut count = 0u64;
     let mut origins: BTreeMap<String, u64> = BTreeMap::new();
@@ -2520,7 +2530,14 @@ fn audio_network_outline(client: &mut CdpClient, secrets: &mut Secrets) -> Value
             }
         }
     }
-    json!({"request_count": count, "origins": origins, "endpoints": endpoints, "truncated": truncated})
+    let mut unavailable: Vec<&str> = Vec::new();
+    if !enabled {
+        unavailable.push("network (the browser refused Network.enable)");
+    }
+    if dropped > 0 {
+        unavailable.push("some events (the browser event queue overflowed)");
+    }
+    json!({"request_count": count, "origins": origins, "endpoints": endpoints, "truncated": truncated, "dropped": dropped, "unavailable": unavailable})
 }
 
 /// Origin and path of a URL, with the query and fragment dropped. A relative or malformed URL

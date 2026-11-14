@@ -24,18 +24,26 @@ fn fake_cdp() -> (String, Arc<AtomicBool>) {
 /// Start a fake CDP endpoint whose `Runtime.evaluate` answers with `value` (the remote object's
 /// `value`, e.g. an audio report or `null` for a page with no AudioContext).
 fn fake_cdp_with_eval(value: Value) -> (String, Arc<AtomicBool>) {
+    fake_cdp_with_eval_and_failing(value, &[])
+}
+
+/// As [`fake_cdp_with_eval`], but the browser refuses `failing` methods with a CDP error (what a
+/// browser without that domain does), so a tool's "unavailable" path can be exercised.
+fn fake_cdp_with_eval_and_failing(value: Value, failing: &[&str]) -> (String, Arc<AtomicBool>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let url = format!("http://127.0.0.1:{port}");
     let ws_seen = Arc::new(AtomicBool::new(false));
     let ws_seen2 = ws_seen.clone();
     let eval = Arc::new(value);
+    let failing: Arc<Vec<String>> = Arc::new(failing.iter().map(|method| (*method).to_string()).collect());
     std::thread::spawn(move || {
         for s in listener.incoming() {
             let Ok(stream) = s else { break };
             let seen = ws_seen2.clone();
             let eval = eval.clone();
-            std::thread::spawn(move || serve(stream, port, seen, eval));
+            let failing = failing.clone();
+            std::thread::spawn(move || serve(stream, port, seen, eval, failing));
         }
     });
     (url, ws_seen)
@@ -67,7 +75,7 @@ fn http_json(stream: &mut TcpStream, body: &str) {
     let _ = stream.write_all(resp.as_bytes());
 }
 
-fn serve(mut stream: TcpStream, port: u16, ws_seen: Arc<AtomicBool>, eval: Arc<Value>) {
+fn serve(mut stream: TcpStream, port: u16, ws_seen: Arc<AtomicBool>, eval: Arc<Value>, failing: Arc<Vec<String>>) {
     let (request_line, headers) = read_headers(&mut stream);
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
     if path.starts_with("/json/version") {
@@ -95,7 +103,7 @@ fn serve(mut stream: TcpStream, port: u16, ws_seen: Arc<AtomicBool>, eval: Arc<V
         let accept = ws_accept(&key);
         let resp = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n");
         let _ = stream.write_all(resp.as_bytes());
-        serve_ws(&mut stream, &eval);
+        serve_ws(&mut stream, &eval, &failing);
         ws_seen.store(true, Ordering::Relaxed);
         return;
     }
@@ -162,7 +170,7 @@ fn ws_write(stream: &mut TcpStream, text: &str) {
     let _ = stream.write_all(&frame);
 }
 
-fn serve_ws(stream: &mut TcpStream, eval: &Value) {
+fn serve_ws(stream: &mut TcpStream, eval: &Value, failing: &[String]) {
     let bundle = craft_anything_testkit::electron::WEBPACK_BUNDLE;
     while let Some(msg) = ws_read(stream) {
         let req: Value = match serde_json::from_str(&msg) {
@@ -171,6 +179,10 @@ fn serve_ws(stream: &mut TcpStream, eval: &Value) {
         };
         let id = req.get("id").and_then(Value::as_u64).unwrap_or(0);
         let method = req.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+        if failing.iter().any(|refused| refused == &method) {
+            ws_write(stream, &json!({"id": id, "error": {"code": -32601, "message": format!("'{method}' wasn't found")}}).to_string());
+            continue;
+        }
         // Reply to the command.
         let result = match method.as_str() {
             "DOM.getDocument" => json!({"root": {"nodeId": 1, "nodeType": 9, "nodeName": "#document", "children": [
@@ -1339,4 +1351,52 @@ fn capture_runs_only_in_deep_mode() {
     assert_eq!(err.code, ErrorCode::FeatureMissing, "{}", err.message);
     assert_eq!(err.details.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("clean_room"));
     assert!(err.remediation.as_deref().unwrap_or_default().contains("Deep mode"), "{:?}", err.remediation);
+}
+
+#[test]
+fn capture_counts_redactions_made_after_the_snapshot() {
+    // Nothing here is on the network: the secret lives only in the page's report, which is
+    // scrubbed after the result object is built. The count must include those redactions.
+    const REPORT_ONLY: &str = "report-only-SECRET-7";
+    let mut report = audio_report();
+    report["mixer_state"] = json!({"scenario_id": "focus", "label": REPORT_ONLY});
+    let mut counts = serde_json::Map::new();
+    counts.insert(format!("gain-{REPORT_ONLY}"), json!(1));
+    report["graph"]["node_counts"] = Value::Object(counts);
+    let (url, _) = fake_cdp_with_eval(report);
+    let e = Engine::new(crate::testing::session());
+    let v = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000, "hidden_values": [REPORT_ONLY]})).unwrap();
+    let redactions = v["result"]["secret_redactions"].as_u64().unwrap_or(0);
+    assert!(redactions >= 2, "the mixer and graph occurrences are counted, not only those redacted before the snapshot: {redactions}");
+    assert!(!v.to_string().contains(REPORT_ONLY), "the report-only secret never appears in the evidence");
+}
+
+#[test]
+fn capture_outlines_the_requests_it_saw_while_listening() {
+    let (url, _) = fake_cdp_with_eval(audio_report());
+    let e = Engine::new(crate::testing::session());
+    let v = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000, "hidden_values": [SECRET]})).unwrap();
+    let outline = &v["result"]["network_outline"];
+    assert_eq!(outline["request_count"], 1, "{outline}");
+    assert_eq!(outline["origins"]["https://app.test"], 1, "{outline}");
+    assert_eq!(outline["endpoints"][0]["method"], "GET", "{outline}");
+    assert_eq!(outline["endpoints"][0]["endpoint"], "https://app.test/api/items", "{outline}");
+    assert_eq!(outline["dropped"], 0, "{outline}");
+    assert_eq!(outline["unavailable"], json!([]), "{outline}");
+    assert!(!outline.to_string().contains(SECRET), "query values are dropped and the secret is redacted: {outline}");
+}
+
+#[test]
+fn capture_marks_the_network_outline_unavailable_when_the_browser_refuses_it() {
+    let (url, _) = fake_cdp_with_eval_and_failing(audio_report(), &["Network.enable"]);
+    let e = Engine::new(crate::testing::session());
+    let v = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000})).unwrap();
+    let outline = &v["result"]["network_outline"];
+    assert_eq!(outline["request_count"], 0, "{outline}");
+    assert_eq!(outline["dropped"], 0, "{outline}");
+    let unavailable = outline["unavailable"].as_array().cloned().unwrap_or_default();
+    assert!(
+        unavailable.iter().any(|reason| reason.as_str().unwrap_or_default().contains("Network.enable")),
+        "a refused enable is named, not silently reported as no requests: {outline}"
+    );
 }
