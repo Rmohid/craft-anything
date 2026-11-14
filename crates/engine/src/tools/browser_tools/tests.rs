@@ -280,7 +280,25 @@ fn serve_ws(stream: &mut TcpStream, eval: &Value, failing: &[String]) {
             "DOMStorage.getDOMStorageItems" => json!({"entries": [["theme", "dark-VALUE"]]}),
             "Network.getCookies" => json!({"cookies": [{"name": "sid", "value": "cookie-VALUE"}]}),
             // The audio capture's introspection script; the test decides what the page reports.
-            "Runtime.evaluate" => json!({"result": {"value": eval.clone()}}),
+            // The interaction-trace scripts are recognised by their markers: the tracer starts,
+            // the collector returns the two readings a 10 Hz poll would have taken.
+            "Runtime.evaluate" => {
+                let expression = req.pointer("/params/expression").and_then(Value::as_str).unwrap_or_default();
+                if expression.contains("__craftAnythingTraceStart") {
+                    json!({"result": {"value": {"started": true, "layers": 1}}})
+                } else if expression.contains("__craftAnythingTraceStop") {
+                    json!({"result": {"value": {
+                        "samples": [
+                            {"t_ms": 0, "layer_id": "pad", "gain": 0.0, "pan": 0.0},
+                            {"t_ms": 200, "layer_id": "pad", "gain": 1.0, "pan": 0.0}
+                        ],
+                        "truncated": false,
+                        "traced_ms": 200
+                    }}})
+                } else {
+                    json!({"result": {"value": eval.clone()}})
+                }
+            }
             _ => json!({}),
         };
         ws_write(stream, &json!({"id": id, "result": result}).to_string());
@@ -1289,6 +1307,36 @@ fn mismatched_envelope_lengths_still_compare() {
 }
 
 #[test]
+fn flipped_slider_direction_fails_audio_compare() {
+    let e = Engine::new(crate::testing::session());
+    let trace = |rising: bool| -> Vec<Value> {
+        let (first, last) = if rising { (0.0, 1.0) } else { (1.0, 0.0) };
+        vec![json!({"t_ms": 0, "layer_id": "pad", "gain": first, "pan": 0.0}), json!({"t_ms": 1_000, "layer_id": "pad", "gain": last, "pan": 0.0})]
+    };
+    // The spectrum and loudness are identical on both sides; only the traced slider direction flips.
+    let before = call(
+        &e,
+        "web_audio_fingerprint",
+        json!({"spectrum": [1.0, 2.0, 3.0], "rms": [0.2, 0.4], "mixer_state": {"scenario_id": "focus"}, "mixer_envelope": trace(true)}),
+    )
+    .unwrap();
+    let after = call(
+        &e,
+        "web_audio_fingerprint",
+        json!({"spectrum": [1.0, 2.0, 3.0], "rms": [0.2, 0.4], "mixer_state": {"scenario_id": "focus"}, "mixer_envelope": trace(false)}),
+    )
+    .unwrap();
+    let cmp = call(&e, "web_audio_compare", json!({"before": before.clone(), "after": after})).unwrap();
+    assert!((cmp["result"]["log_bin_cosine"].as_f64().unwrap_or(0.0) - 1.0).abs() < 1e-9, "the spectra are identical");
+    assert!(cmp["result"]["envelope_distance"].as_f64().unwrap_or(0.0) > 0.5, "{}", cmp["result"]);
+    assert_eq!(cmp["result"]["likeness_pass"], false, "a flipped slider direction is not the same mix: {}", cmp["result"]);
+
+    // The same direction still compares as alike.
+    let same = call(&e, "web_audio_compare", json!({"before": before.clone(), "after": before})).unwrap();
+    assert_eq!(same["result"]["likeness_pass"], true, "{}", same["result"]);
+}
+
+#[test]
 fn graph_diff_reports_added_and_removed_nodes_and_edges() {
     let e = Engine::new(crate::testing::session());
     let fingerprint = |counts: Value, edges: Value| {
@@ -1458,6 +1506,65 @@ fn capture_marks_the_network_outline_unavailable_when_the_browser_refuses_it() {
     );
 }
 
+#[test]
+fn capture_records_an_interaction_traced_envelope() {
+    let (url, _) = fake_cdp_with_eval(audio_report());
+    let e = Engine::new(crate::testing::session());
+    let v = capture_call(
+        &e,
+        json!({
+            "cdp_endpoint": url,
+            "duration_ms": 5000,
+            "interaction_trace": true,
+            "steps": [
+                {"step_id": "raise the pad", "kind": "click", "selector": "#pad-slider"},
+                {"kind": "wait", "ms": 10}
+            ]
+        }),
+    )
+    .unwrap();
+    let r = &v["result"];
+    let envelope = r["mixer_envelope"].as_array().cloned().unwrap_or_default();
+    assert_eq!(envelope.len(), 2, "{r}");
+    assert_eq!(envelope[0]["layer_id"], "pad");
+    assert_eq!(envelope[0]["gain"], 0.0);
+    assert_eq!(envelope[1]["gain"], 1.0, "the slider move is in the traced envelope");
+    assert_eq!(r["interaction_trace"]["enabled"], true);
+    assert_eq!(r["interaction_trace"]["step_count"], 2);
+    assert_eq!(r["interaction_trace"]["aborted"], Value::Null);
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(!codes.contains(&"no_interaction_trace"), "a traced capture must not claim it has no trace: {codes:?}");
+    assert!(codes.contains(&"envelope_after_snapshot"), "the spectrum predates the steps and must say so: {codes:?}");
+
+    // The envelope reaches the fingerprint through the capture, and compares as the same mix.
+    let fp = call(&e, "web_audio_fingerprint", json!({"capture": v.clone()})).unwrap();
+    assert_eq!(fp["result"]["fingerprint"]["mixer_envelope"].as_array().map(Vec::len), Some(2), "{}", fp["result"]);
+    let cmp = call(&e, "web_audio_compare", json!({"before": fp.clone(), "after": fp})).unwrap();
+    assert_eq!(cmp["result"]["envelope_distance"].as_f64(), Some(0.0));
+    assert_eq!(cmp["result"]["likeness_pass"], true, "{}", cmp["result"]);
+}
+
+#[test]
+fn capture_without_a_trace_says_so() {
+    let (url, _) = fake_cdp_with_eval(audio_report());
+    let e = Engine::new(crate::testing::session());
+    let v = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000})).unwrap();
+    assert_eq!(v["result"]["mixer_envelope"], json!([]));
+    assert_eq!(v["result"]["interaction_trace"]["enabled"], false);
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(codes.contains(&"no_interaction_trace"), "{codes:?}");
+}
+
+#[test]
+fn capture_refuses_too_many_interaction_steps() {
+    let (url, _) = fake_cdp();
+    let e = Engine::new(crate::testing::session());
+    let steps = vec![json!({"kind": "wait", "ms": 1}); 201];
+    let err = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000, "interaction_trace": true, "steps": steps})).unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadInput, "{}", err.message);
+    assert!(err.message.contains("steps"), "{}", err.message);
+}
+
 // ---------------------------------------------------------------------------------------------
 // web_audio_offline_render (Deep-only, headless OfflineAudioContext)
 
@@ -1596,6 +1703,105 @@ fn offline_render_script_counts_the_same_node_kinds_as_a_live_capture() {
         );
     }
     assert!(super::OFFLINE_RENDER_SCRIPT.contains("link('analyser', 'audio_destination')"), "the destination edge must be recorded too");
+}
+
+#[test]
+fn offline_render_script_never_shadows_global_window() {
+    // Cheap shape guard, not an execution: the fake CDP used by the other offline tests never
+    // runs this script, so a live-only breakage (like the Hann-window `const window` that put
+    // `window` in the temporal dead zone and broke every real render) passes those tests.
+    // Declare nothing named `window` anywhere in the script function, so `window.OfflineAudioContext`
+    // resolves to the global instead of throwing ReferenceError before the first line.
+    let script = super::OFFLINE_RENDER_SCRIPT;
+    for declaration in ["const window", "let window", "var window", "function window", "const window=", "let window="] {
+        assert!(!script.contains(declaration), "the offline script must not shadow the global `window` (found `{declaration}`); that breaks every real render");
+    }
+    assert!(script.contains("window.OfflineAudioContext"), "the script must read the global window");
+}
+
+#[test]
+fn offline_render_schedules_layer_envelopes_and_fingerprints_them() {
+    let (url, _) = fake_cdp_with_eval(offline_report());
+    let e = Engine::new(crate::testing::session());
+    let recipe = json!({
+        "version": 1,
+        "scenario_id": "focus",
+        "layers": [{
+            "id": "pad",
+            "kind": "oscillator",
+            "wave": "sine",
+            "frequency": 220.0,
+            "gain": 0.4,
+            "envelope": [
+                {"t_ms": 0, "gain": 0.0, "pan": 0.0},
+                {"t_ms": 2000, "gain": 1.0, "pan": -0.5}
+            ]
+        }]
+    });
+    let v = offline_call(&e, json!({"cdp_endpoint": url, "recipe": recipe.clone(), "duration_ms": 30000})).unwrap();
+    let envelope = v["result"]["fingerprint"]["mixer_envelope"].as_array().cloned().unwrap_or_default();
+    assert_eq!(envelope.len(), 2, "{}", v["result"]);
+    assert_eq!(envelope[0]["layer_id"], "pad");
+    assert_eq!(envelope[0]["gain"], 0.0);
+    assert_eq!(envelope[1]["gain"], 1.0);
+    assert!((envelope[1]["pan"].as_f64().unwrap_or(0.0) + 0.5).abs() < 1e-6);
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(!codes.contains(&"no_interaction_trace"), "a recipe with envelopes is not untraced: {codes:?}");
+
+    // The generated page script schedules the curve before startRendering(), for gain and pan.
+    let parsed: super::OfflineRecipe = serde_json::from_value(recipe).unwrap();
+    let plan = super::offline_recipe_plan(&parsed).unwrap();
+    assert_eq!(plan["layers"][0]["envelope"].as_array().map(Vec::len), Some(2), "{plan}");
+    let script = super::offline_render_script(&plan, 30_000, 48_000).unwrap();
+    assert!(script.contains("setValueCurveAtTime"), "the curve must be scheduled");
+    assert!(script.contains("gain.gain.setValueCurveAtTime"), "the gain trajectory must be scheduled");
+    assert!(script.contains("panner.pan.setValueCurveAtTime"), "a pan trajectory needs a panner, even when the base pan is 0");
+    let schedule = script.find("setValueCurveAtTime").unwrap_or(usize::MAX);
+    let render = script.find("startRendering").unwrap_or(0);
+    assert!(schedule < render, "curves are scheduled before the render starts");
+
+    // A flipped envelope fails the likeness verdict against a rising reference.
+    let rising = v["result"]["fingerprint"].clone();
+    let falling = call(
+        &e,
+        "web_audio_fingerprint",
+        json!({
+            "spectrum": [0.0, 12.0, 40.0, 120.0, 255.0, 90.0],
+            "rms": [0.12, 0.2, 0.18],
+            "graph": {"node_counts": {}, "edges": []},
+            "mixer_state": {"scenario_id": "focus"},
+            "mixer_envelope": [
+                {"t_ms": 0, "layer_id": "pad", "gain": 1.0, "pan": -0.5},
+                {"t_ms": 2000, "layer_id": "pad", "gain": 0.0, "pan": 0.0}
+            ]
+        }),
+    )
+    .unwrap();
+    let cmp = call(&e, "web_audio_compare", json!({"before": rising.clone(), "after": falling})).unwrap();
+    assert_eq!(cmp["result"]["likeness_pass"], false, "{}", cmp["result"]);
+    let same = call(&e, "web_audio_compare", json!({"before": rising.clone(), "after": rising})).unwrap();
+    assert_eq!(same["result"]["likeness_pass"], true, "{}", same["result"]);
+}
+
+#[test]
+fn offline_render_refuses_a_single_point_or_oversized_envelope() {
+    let e = Engine::new(crate::testing::session());
+    for (envelope, expected) in [
+        (json!([{"t_ms": 0, "gain": 0.0, "pan": 0.0}]), ErrorCode::BadInput),
+        (json!((0..super::MAX_OFFLINE_ENVELOPE + 1).map(|i| json!({"t_ms": i, "gain": 0.5, "pan": 0.0})).collect::<Vec<_>>()), ErrorCode::OverLimit),
+        (json!([{"t_ms": 1000, "gain": 0.0, "pan": 0.0}, {"t_ms": 0, "gain": 1.0, "pan": 0.0}]), ErrorCode::BadInput),
+    ] {
+        let err = offline_call(
+            &e,
+            json!({
+                "cdp_endpoint": "http://127.0.0.1:9",
+                "recipe": {"version": 1, "layers": [{"id": "pad", "kind": "oscillator", "envelope": envelope}]},
+                "duration_ms": 1000
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, expected, "{}", err.message);
+    }
 }
 
 #[test]

@@ -551,6 +551,13 @@ mod tests {
     }
 
     #[test]
+    fn mirrored_slider_steps_fail_compare() {
+        let up = vec![EnvelopeSample { t_ms: 0, layer_id: "pad".into(), gain: 0.0, pan: 0.0 }];
+        let down = vec![EnvelopeSample { t_ms: 0, layer_id: "pad".into(), gain: 1.0, pan: 0.0 }];
+        assert!(envelope_distance(&up, &down) > 0.5, "mirrored steps must not compare as alike");
+    }
+
+    #[test]
     fn envelope_distance_is_zero_for_identical_trajectories() {
         let trace = vec![
             EnvelopeSample { t_ms: 0, layer_id: "pad".into(), gain: 0.0, pan: 0.0 },
