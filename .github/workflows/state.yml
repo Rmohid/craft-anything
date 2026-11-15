@@ -5,6 +5,8 @@ name: state
 # backstop that cannot be uninstalled by the agent.
 on:
   pull_request:
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -16,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install the checker's test runner
         run: python3 -m pip install pytest
-      - name: Hooks are local; doctor is informational in CI
-        run: python3 scripts/state-check doctor || true
+      - name: The harness-neutral gates must still be installed
+        run: python3 scripts/state-check doctor
       - name: Re-run every mapped test and wire check
         run: python3 scripts/state-check --run --final

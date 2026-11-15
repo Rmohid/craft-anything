@@ -235,6 +235,14 @@ class TestStruct(Base):
         )
         self.assertFinding(self.p.run("--struct"), "needs a reason")
 
+    def test_missing_plan_file(self):
+        (self.p.dir / "docs/superpowers/plans/demo.md").unlink()
+        self.assertFinding(self.p.run("--struct"), "plan not found")
+
+    def test_missing_ledger_at_final(self):
+        (self.p.dir / "docs/superpowers/progress.md").unlink()
+        self.assertFinding(self.p.run("--struct", "--final"), "ledger not found")
+
     def test_done_without_evidence(self):
         self.p.patch(
             "docs/superpowers/state/demo/STATE.md",

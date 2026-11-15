@@ -159,6 +159,12 @@ def struct(st, root, final):
     else:
         sr = spec_reqs(spec)
 
+    plan = root / hdr.get("plan", "")
+    if not hdr.get("plan"):
+        errs.append("plan path missing from the header")
+    elif not plan.is_file():
+        errs.append(f"plan not found: {plan}")
+
     # Gap 4: the spec's requirement ids and the state's must be the same set.
     if set(sr) != set(st["req"]):
         errs.append(
