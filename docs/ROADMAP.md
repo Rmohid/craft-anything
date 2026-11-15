@@ -2798,14 +2798,17 @@ Owner: open · Status: in progress
 - [ ] Make the fingerprint's log-bin shape robust to the page analyser's FFT size: a live-identical
       loopback rendition scored cosine 0.98 against the offline render with an 8192-point analyser,
       but 0.52 with the 2048-point default (below the 0.85 acceptance bar).
-- [ ] Make the agent choose the audio tools unprompted: typed `audio_evidence` (signal kinds, so a
+- [x] Make the agent choose the audio tools unprompted: typed `audio_evidence` (signal kinds, so a
       fingerprinting script's `OfflineAudioContext` and an `<audio>` element are not mistaken for a
-      capturable WebAudio graph) on `web_site_capture` and `core_target_triage`; display-only
-      `affordances` on evidence, excluded from its id so the same observation keeps one identity in
-      every mode; intent-first summaries for the four audio tools; and Clean room offering
-      `clean_room::TOOLS ∩ registry` so the Clean-room-allowed fingerprint/compare are reachable
-      there at all. `core_tool_search` waits on the control-arm eval result.
+      capturable WebAudio graph) on `web_site_capture`; display-only `affordances` on evidence,
+      excluded from its id so the same observation keeps one identity in every mode; intent-first
+      summaries for the four audio tools; and Clean room offering `clean_room::TOOLS ∩ registry` so
+      the Clean-room-allowed fingerprint/compare are reachable there at all.
       — claimed: opencode-agent, branch `feature/r3.13-unprompted-audio-choice`
+- [ ] Prove unprompted choice with the two-arm eval (control vs patched, N≥5 each, bar: an audio
+      tool within 4 turns after the first `web_site_capture` result). Gated: it spends the app's
+      model keys rather than the batch budget, so it runs only on a sized estimate and an explicit
+      go-ahead. `core_target_triage` gains `audio_evidence` when it holds a file inventory to read.
 - [ ] Live-proof the attached Endel capture end to end: 30 s from the signed-in ego browser
       while Focus plays — graph, spectrum, mixer snapshot, nothing secret in the evidence
       (`web_audio_offline_render`, fingerprint and compare already prove live).

@@ -8,6 +8,7 @@
 //! what any visitor sees on the page.
 
 use super::artifact_tools::{create_absent_dir, write_new_file};
+use super::audio_signals::{self, Signal};
 use super::browser_tools::{browser_env, cleanup, deadline};
 use super::native_common::spec;
 use super::web_common::{self, Browser, LaunchOptions};
@@ -874,6 +875,64 @@ const LAYOUT_JS: &str = r#"(() => {
     type: {h1: size('h1'), h2: size('h2'), h3: size('h3'), body: size('p')}, blocks};
 })()"#;
 
+/// The page's own media elements, as tags (`audio`, `video`), capped.
+const MEDIA_ELEMENTS_JS: &str = r#"Array.from(document.querySelectorAll('audio,video')).slice(0, 8).map(e => e.tagName.toLowerCase())"#;
+
+/// What the page says about sound: its media elements, the scripts it lists (Deep mode only) and
+/// the sound files it loaded (Deep mode only). Clean room reads what a visitor sees, so it sees
+/// the elements and nothing about the page's code or requests, and the coverage sentence says so.
+fn probe_audio(client: &mut CdpClient, blueprint: &Value, visitor: bool, dl: &Deadline) -> (Vec<Signal>, String) {
+    let tags: Vec<String> = eval(client, MEDIA_ELEMENTS_JS, dl).ok().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+    if visitor {
+        let p = audio_signals::from_observation(&tags, &[], 0, &[], true, 0);
+        return (p.signals, p.coverage);
+    }
+    let listed: Vec<String> = blueprint
+        .pointer("/assets/scripts")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).take(audio_signals::SCRIPT_COUNT).map(str::to_string).collect())
+        .unwrap_or_default();
+    let total = blueprint.pointer("/assets/scripts").and_then(Value::as_array).map_or(0, Vec::len);
+    let (read, unread) = read_scripts(client, &listed, dl);
+    let requests: Vec<&str> =
+        blueprint.pointer("/assets/requests").and_then(Value::as_array).into_iter().flatten().filter_map(|r| r.get("url").and_then(Value::as_str)).collect();
+    let p = audio_signals::from_observation(&tags, &read, total, &requests, false, unread);
+    (p.signals, p.coverage)
+}
+
+/// Read the page's own scripts, same-origin only, capped in count and bytes, from the page's own
+/// cache. One expression, so a slow or missing script costs one bounded fetch, never a hang.
+fn read_scripts(client: &mut CdpClient, urls: &[String], dl: &Deadline) -> (Vec<(String, String)>, usize) {
+    if urls.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let list = serde_json::to_string(urls).unwrap_or_else(|_| "[]".to_string());
+    let js = format!(
+        r#"(async () => {{
+  const out = {{}};
+  for (const u of {list}) {{
+    try {{
+      if (new URL(u, location.href).origin !== location.origin) continue;
+      const r = await fetch(u, {{credentials: 'same-origin', signal: AbortSignal.timeout(1500)}});
+      if (!r.ok) continue;
+      out[u] = (await r.text()).slice(0, {cap});
+    }} catch (e) {{}}
+  }}
+  return out;
+}})()"#,
+        cap = audio_signals::SCRIPT_BYTES
+    );
+    let total = urls.len();
+    match eval(client, &js, dl) {
+        Ok(Value::Object(map)) => {
+            let got: Vec<(String, String)> = map.into_iter().filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string()))).collect();
+            let unread = total.saturating_sub(got.len());
+            (got, unread)
+        }
+        _ => (Vec::new(), total),
+    }
+}
+
 fn web_site_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: CaptureParams = parse_params(params)?;
     if p.widths.is_empty() || p.widths.len() > 4 || p.widths.iter().any(|w| !(320..=3840).contains(w)) {
@@ -909,8 +968,14 @@ fn web_site_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     if let Some(w) = p.widths.first() {
         let _ = set_viewport(&mut client, *w, 900, &dl);
     }
+    // What the page says about sound, read while its elements and scripts are still here.
+    let audio = match &r {
+        Ok((blueprint, _, _)) => Some(probe_audio(&mut client, blueprint, visitor, &dl)),
+        Err(_) => None,
+    };
     cleanup(&mut client, &dl);
     let (mut blueprint, shots, html) = r?;
+    let (audio_signals, audio_coverage) = audio.unwrap_or_default();
     let html_bytes = html.0;
     if visitor {
         visitor_view(&mut blueprint);
@@ -928,13 +993,14 @@ fn web_site_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     write_new_file(&out, &["capture.json".into()], &capture_json).map_err(ToolError::invalid)?;
 
     let summary = format!(
-        "Captured {shown}: {} screenshot(s), {} outline items, {} headings, {images} images, {} links, {} forms → {}.",
+        "Captured {shown}: {} screenshot(s), {} outline items, {} headings, {images} images, {} links, {} forms → {}.{}",
         shots.len(),
         n("outline"),
         n("headings"),
         n("links"),
         n("forms"),
-        out.display()
+        out.display(),
+        audio_signals::summary_sentence(&audio_signals).map(|s| format!(" {s}")).unwrap_or_default()
     );
     let browser = site.handle();
     let ev = EvidenceBuilder::new("web_site_capture", Subject { kind: "website".into(), sha256: None, name: Some(shown.clone()) }, browser_env(ctx.session.clean_room(), &browser))
@@ -948,10 +1014,12 @@ fn web_site_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
             "counts": {"outline": n("outline"), "headings": n("headings"), "links": n("links"), "forms": n("forms"), "images": images},
             "design": blueprint.get("design"),
             "files": ["README.md", "capture.json"],
+            "audio_evidence": audio_signals::evidence_json(&audio_signals, &audio_coverage),
         }))
         .summary(summary)
         .confidence(Confidence::Observed)
         .authority(Authority::OurRun)
+        .affordances(audio_signals::affordances(&audio_signals, visitor))
         .limitation(Limitation::new("one_state", "One state of the page: menus, dialogs and content behind interactions are not opened."))
         .limitation(if visitor {
             Limitation::new("visitor_view", "Clean room: only what a visitor sees was kept (screenshots, visible text, measured layout and styles); not the page's HTML, CSS rules, scripts, requests or errors.")

@@ -144,7 +144,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "web_audio_fingerprint",
             "Fingerprint an audio scene",
-            "Turn a web_audio_capture result (the evidence record, its id, or its raw {graph, spectrum, rms, mixer_state, mixer_envelope} object) — or an inline spectrum and RMS envelope — into a versioned audio fingerprint: 48 log-spaced spectrum bins, a 1 Hz loudness envelope, the audio-graph signature and the page's mixer state. Pure computation over evidence already in hand; no browser.",
+            "Record what a web page's sound is like — 48 log-spaced spectrum bins, a 1 Hz loudness envelope, the audio-graph signature and the page's mixer state — so a rebuild can be compared against it. Takes a web_audio_capture result (the evidence record, its id, or its raw {graph, spectrum, rms, mixer_state, mixer_envelope} object) or an inline spectrum and RMS envelope. Pure computation over evidence already in hand; no browser.",
             "Record what a web page's audio sounds like, so two captures can be compared.",
             Toolset::Browser,
             Effects::EVIDENCE,
@@ -155,7 +155,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "web_audio_compare",
             "Compare two audio fingerprints",
-            "Compare two audio fingerprints (from web_audio_fingerprint or web_audio_offline_render): log-bin cosine, RMS-envelope correlation, graph differences, mixer-envelope distance, and whether the two scenes are alike (spectral cosine, RMS correlation and, when both sides have one, the traced mixer trajectory within their tolerances; 0.85, 0.80 and 0.85 by default). Pure computation; no browser.",
+            "Measure whether a rebuilt sound matches the original: log-bin cosine, RMS-envelope correlation, graph differences and mixer-envelope distance, with one typed alike verdict against the caller's tolerances (0.85, 0.80 and 0.85 by default). Takes two fingerprints from web_audio_fingerprint or web_audio_offline_render. Pure computation; no browser.",
             "Measure whether a rebuilt audio scene sounds like the original.",
             Toolset::Browser,
             Effects::EVIDENCE,
@@ -166,7 +166,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "web_audio_capture",
             "Capture a page's live audio",
-            "Listen to a page's live Web Audio graph over CDP for 5 to 120 seconds: node kinds and connections, an AnalyserNode's averaged frequency spectrum, a 1 Hz loudness envelope, the page's mixer state (scenario id, layer gains and pans), and an outline of the requests the page made while listening. Set `interaction_trace` with scripted `steps` to follow the mix's movement: each layer's gain and pan is polled at 10 Hz into `mixer_envelope` (at most 6000 readings over 60 seconds). Injects an introspection script, so it needs your approval and Deep mode; cookies, storage values and declared secrets are redacted, and no audio is recorded.",
+            "Measure the sound a web page is playing right now, so a rebuild can be compared against it: listen to its live Web Audio graph over CDP for 5 to 120 seconds — node kinds and connections, an AnalyserNode's averaged frequency spectrum, a 1 Hz loudness envelope, the page's mixer state (scenario id, layer gains and pans), and an outline of the requests the page made while listening. Set `interaction_trace` with scripted `steps` to follow the mix's movement: each layer's gain and pan is polled at 10 Hz into `mixer_envelope` (at most 6000 readings over 60 seconds). Injects an introspection script, so it needs your approval and Deep mode; cookies, storage values and declared secrets are redacted, and no audio is recorded.",
             "Measure what a web page is playing right now, so a rebuild can be compared against it.",
             Toolset::Browser,
             Effects::EVIDENCE.union(Effects::EXECUTES_FOREIGN_CODE).union(Effects::ACCESSES_NETWORK).union(Effects::LAUNCHES_PROCESS),
@@ -177,7 +177,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "web_audio_offline_render",
             "Render an audio recipe offline",
-            "Rebuild an audio scene from a versioned recipe (oscillator layers with an optional filter, gain and pan, and an optional gain/pan envelope scheduled with setValueCurveAtTime; at most 256 layers) in a headless OfflineAudioContext, then fingerprint what it rendered: 48 log-spaced spectrum bins, a 1 Hz loudness envelope, the recipe's graph signature and its scheduled mixer trajectory, plus the rendered length. Launches or attaches to a Chromium over CDP and injects the recipe, so it needs your approval and Deep mode. The fingerprint goes straight into web_audio_compare as the rebuilt side.",
+            "Render a rebuild's sound recipe in a private headless browser and measure how close it comes to the original: a versioned recipe (oscillator layers with an optional filter, gain and pan, and an optional gain/pan envelope scheduled with setValueCurveAtTime; at most 256 layers) into a headless OfflineAudioContext, then fingerprint what it rendered — 48 log-spaced spectrum bins, a 1 Hz loudness envelope, the recipe's graph signature and its scheduled mixer trajectory, plus the rendered length. Launches or attaches to a Chromium over CDP and injects the recipe, so it needs your approval and Deep mode. The fingerprint goes straight into web_audio_compare as the rebuilt side.",
             "Rebuild a sound recipe in a private headless browser and measure how close it comes to the original.",
             Toolset::Browser,
             Effects::EVIDENCE.union(Effects::EXECUTES_FOREIGN_CODE).union(Effects::ACCESSES_NETWORK).union(Effects::LAUNCHES_PROCESS),

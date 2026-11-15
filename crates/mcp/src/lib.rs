@@ -387,7 +387,13 @@ impl Server {
         if self.restricted_refusal(s.id).is_some() {
             return false;
         }
-        self.visible(s.toolset) && (!clean || craft_anything_engine::clean_room::allows(s.id))
+        // Clean room lists the tools it runs, whatever toolset they belong to: permission there
+        // belongs to the tool, not to its group (its audio fingerprint and compare are Browser
+        // tools that must be reachable without enabling every Deep browser tool).
+        if clean {
+            return craft_anything_engine::clean_room::allows(s.id);
+        }
+        self.visible(s.toolset)
     }
 
     fn tools_list(&self) -> Value {
@@ -405,6 +411,7 @@ impl Server {
     }
 
     fn toolsets_json(&self) -> Value {
+        let clean = self.engine.session().clean_room();
         let sets: Vec<Value> = self
             .engine
             .registry()
@@ -415,6 +422,10 @@ impl Server {
                     "id": t.id(),
                     "title": t.title(),
                     "tools": self.engine.registry().in_toolset(*t).count(),
+                    // How many of them are on this connection's list. In Clean room a toolset is
+                    // not enabled yet some of its tools are listed (the ones Clean room runs), so
+                    // `enabled` alone would read as "nothing from here is available".
+                    "listed": self.engine.registry().all().iter().filter(|s| s.toolset == *t && self.listed(s, clean)).count(),
                     "enabled": self.visible(*t),
                 })
             })

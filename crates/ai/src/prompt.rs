@@ -14,7 +14,7 @@ How to work:
 - Keep three lists apart in your answers: what was observed, what you infer, and what is still unknown.
 - Static analysis never shows that code actually ran. Only tools that run the target can show that, and they ask the user first.
 - Never repeat an identical call that already failed or already answered.
-- If a tool you need isn't in your list, call list_toolsets, then enable_toolset.";
+- If a tool you need isn't in your list, call list_toolsets, then enable_toolset. If evidence names something you have no tool for, look for a tool by what it does before saying you can't.";
 
 /// The memory loop, for a model that has the Core tools it names (a lean local builder doesn't).
 const MEMORY: &str = "\

@@ -100,6 +100,25 @@ fn tool_names(v: &Value) -> Vec<String> {
     v["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
 }
 
+/// R3.13: Clean room lists the tools it runs whatever toolset they belong to. Its audio
+/// fingerprint and compare are Browser tools, and a connection starts with Core alone, so listing
+/// by toolset alone hid them from every Clean-room client.
+#[test]
+fn clean_room_lists_the_audio_tools_it_runs_without_enabling_browser() {
+    let mut session = craft_anything_engine::testing::session();
+    session.settings.deep_mode = false;
+    let engine = Arc::new(Engine::new(session));
+    assert!(engine.session().clean_room());
+    let input = format!("{}\n", req(1, "tools/list", json!({})));
+    let buf = Buf::default();
+    serve(engine, ServerOptions::default(), std::io::Cursor::new(input.into_bytes()), Box::new(buf.clone())).unwrap();
+    let out: Vec<Value> = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let names = tool_names(&response(&out, 1));
+    assert!(names.iter().any(|n| n == "web_audio_fingerprint"), "the pure fingerprint must be listed");
+    assert!(names.iter().any(|n| n == "web_audio_compare"), "the pure compare must be listed");
+    assert!(!names.iter().any(|n| n == "web_audio_capture"), "capture injects a script: Deep only");
+}
+
 #[test]
 fn initialize_negotiates_version() {
     let out = run(&[

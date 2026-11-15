@@ -108,9 +108,13 @@ pub fn registry_tools(reg: &Registry, enabled: &BTreeSet<Toolset>) -> Vec<ToolDe
 
 impl ToolHost for EngineHost {
     fn tools(&self, enabled: &BTreeSet<Toolset>) -> Vec<ToolDef> {
-        // Clean room offers only the tools it runs.
-        let clean = self.clean_room();
-        registry_tools(self.0.registry(), enabled).into_iter().filter(|t| !clean || craft_anything_engine::clean_room::allows(&t.name)).collect()
+        // Clean room offers the tools it runs, whatever toolset they belong to: there, permission
+        // belongs to the tool, not to its group. Offering by toolset alone made the Clean-room
+        // audio fingerprint and compare (Browser) unreachable, because Clean room never enables
+        // Browser — which would also have exposed every Deep browser tool.
+        let reg = self.0.registry();
+        let specs = reg.all().iter().filter(|s| if self.clean_room() { craft_anything_engine::clean_room::allows(s.id) } else { enabled.contains(&s.toolset) });
+        specs.map(|s| ToolDef { name: s.id.to_string(), description: s.summary.to_string(), schema: clean_schema(reg.input_schema(s)) }).collect()
     }
 
     fn toolset_of(&self, id: &str) -> Option<Toolset> {
@@ -845,7 +849,13 @@ impl AgentLoop {
                     .host
                     .toolsets()
                     .iter()
-                    .map(|t| json!({"id": t.id(), "title": t.title(), "enabled": self.enabled.contains(t), "tools": self.host.tools(&BTreeSet::from([*t])).len()}))
+                    .map(|t| {
+                        // Counted from what is actually offered: in Clean room the offered list
+                        // ignores toolsets (permission belongs to the tool there), so counting per
+                        // requested toolset would report the whole list for every group.
+                        let offered = self.host.tools(&self.enabled).iter().filter(|d| self.host.toolset_of(&d.name) == Some(*t)).count();
+                        json!({"id": t.id(), "title": t.title(), "enabled": self.enabled.contains(t) || offered > 0, "tools": offered})
+                    })
                     .collect();
                 let text = json!({"toolsets": list}).to_string();
                 return (text, true, "Listed toolsets".into(), None);
@@ -854,9 +864,12 @@ impl AgentLoop {
                 let id = input.get("toolset").and_then(Value::as_str).unwrap_or_default();
                 return match self.host.toolsets().into_iter().find(|t| t.id() == id) {
                     Some(t) => {
+                        let host = Arc::clone(&self.host);
+                        let count = |enabled: &BTreeSet<Toolset>| host.tools(enabled).iter().filter(|d| host.toolset_of(&d.name) == Some(t)).count();
+                        let before = count(&self.enabled);
                         self.enabled.insert(t);
-                        let n = self.host.tools(&BTreeSet::from([t])).len();
-                        (json!({"enabled": id, "tools_added": n}).to_string(), true, format!("Enabled {}", t.title()), None)
+                        let after = count(&self.enabled);
+                        (json!({"enabled": id, "tools_added": after.saturating_sub(before)}).to_string(), true, format!("Enabled {}", t.title()), None)
                     }
                     None => {
                         let e = ToolError::invalid(format!("No toolset {id:?}")).with_remediation("Call list_toolsets for the ids.");
@@ -871,7 +884,7 @@ impl AgentLoop {
                 let e = ToolError::invalid(format!("No tool named {name}"));
                 return (error_text(&e), false, e.message, None);
             }
-            Some(t) if !self.enabled.contains(&t) => {
+            Some(t) if !self.enabled.contains(&t) && !(self.host.clean_room() && craft_anything_engine::clean_room::allows(name)) => {
                 let e = ToolError::invalid(format!("{name} is in the {} toolset, which isn't enabled.", t.id()))
                     .with_remediation(format!("Call enable_toolset with toolset={} first.", t.id()));
                 return (error_text(&e), false, e.message, None);
@@ -1095,6 +1108,26 @@ pub(crate) mod tests {
     }
 
     /// Every place a schema can sit holds an object, as LM Studio requires (#17).
+    /// #R3.13: Clean room offers the tools it runs whatever toolset they belong to. Its audio
+    /// fingerprint and compare are Browser tools, and Clean room never enables Browser (which
+    /// would also expose every Deep browser tool), so offering by toolset alone made them
+    /// unreachable there. A tool Clean room refuses is never offered, even with every toolset on.
+    #[test]
+    fn clean_room_offers_the_audio_tools_it_runs_whatever_their_toolset() {
+        let mut session = craft_anything_engine::testing::session();
+        session.settings.deep_mode = false;
+        let engine = Arc::new(Engine::new(session));
+        assert!(engine.session().clean_room());
+        let host = EngineHost(engine);
+        let names = |tools: Vec<ToolDef>| tools.into_iter().map(|t| t.name).collect::<Vec<_>>();
+        let core = names(host.tools(&BTreeSet::from([Toolset::Core])));
+        assert!(core.iter().any(|n| n == "web_audio_fingerprint"), "the pure fingerprint must be reachable in Clean room");
+        assert!(core.iter().any(|n| n == "web_audio_compare"), "the pure compare must be reachable in Clean room");
+        let every = names(host.tools(&Toolset::ALL.iter().copied().collect()));
+        assert!(!every.iter().any(|n| n == "web_audio_capture"), "capture injects a script: Deep only");
+        assert!(!every.iter().any(|n| n == "web_audio_offline_render"), "the render injects a recipe: Deep only");
+    }
+
     #[test]
     fn tool_schemas_have_only_object_subschemas() {
         let reg = Registry::with_all_tools();

@@ -224,12 +224,42 @@ pub struct Evidence {
     /// Ids of evidence this was derived from.
     #[serde(default)]
     pub links: Vec<String>,
+    /// Tools this record suggests, resolved for the reader's mode when it was built (a page that
+    /// makes sound suggests capturing it). Display-only, like `summary`: excluded from the id, so
+    /// the same observation keeps one identity in every mode and after a suggestion changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affordances: Vec<Affordance>,
     /// True when the result embeds bytes, strings or decompiled text taken from the target
     /// (strings, pseudo-C, source, a captured body, a plist value…). A reader must treat that
     /// content as data from an untrusted artifact, never as instructions. Display-only, like
     /// `summary`: excluded from the id so it never changes an existing record's id.
     #[serde(default, skip_serializing_if = "is_false")]
     pub carries_target_content: bool,
+}
+
+/// A tool this evidence suggests, and why, in plain words. A suggestion, not an instruction: the
+/// reader decides, and a tool that the current mode refuses is never listed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Affordance {
+    /// The tool's id, e.g. `web_audio_capture`.
+    pub tool: String,
+    /// Why this evidence suggests it, in one plain sentence.
+    pub why: String,
+    /// The toolset the tool belongs to, when a client must enable it first (an MCP connection
+    /// starts with Core alone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_toolset: Option<String>,
+}
+
+impl Affordance {
+    pub fn new(tool: impl Into<String>, why: impl Into<String>) -> Self {
+        Affordance { tool: tool.into(), why: why.into(), needs_toolset: None }
+    }
+
+    pub fn in_toolset(mut self, toolset: impl Into<String>) -> Self {
+        self.needs_toolset = Some(toolset.into());
+        self
+    }
 }
 
 fn is_false(b: &bool) -> bool {
@@ -245,6 +275,7 @@ impl Evidence {
             map.remove("summary");
             // Display/provenance-only: never part of the content identity.
             map.remove("carries_target_content");
+            map.remove("affordances");
             if let Some(Value::Object(subject)) = map.get_mut("subject") {
                 subject.remove("name");
             }
@@ -345,6 +376,7 @@ impl EvidenceBuilder {
                 coverage: Coverage::default(),
                 locations: Vec::new(),
                 links: Vec::new(),
+                affordances: Vec::new(),
                 carries_target_content: false,
             },
         }
@@ -409,6 +441,17 @@ impl EvidenceBuilder {
     /// captured body…), so agents and the MCP server treat it as untrusted data, not instructions.
     pub fn target_content(mut self, embeds: bool) -> Self {
         self.ev.carries_target_content = embeds;
+        self
+    }
+
+    /// Suggest a tool this evidence makes worth reaching for (display-only: never part of the id).
+    pub fn affordance(mut self, a: Affordance) -> Self {
+        self.ev.affordances.push(a);
+        self
+    }
+
+    pub fn affordances(mut self, list: impl IntoIterator<Item = Affordance>) -> Self {
+        self.ev.affordances.extend(list);
         self
     }
 
@@ -494,7 +537,27 @@ mod tests {
         let mut b = a.clone();
         b.summary = "Different words".into();
         b.subject.name = Some("renamed.exe".into());
+        b.affordances = vec![Affordance::new("web_audio_capture", "the page makes sound").in_toolset("browser")];
         assert_eq!(b.compute_id().unwrap(), a.id);
+    }
+
+    #[test]
+    fn an_affordance_survives_a_round_trip_and_is_omitted_when_empty() {
+        let plain = sample();
+        let wire = serde_json::to_string(&plain).unwrap();
+        assert!(!wire.contains("affordances"), "nothing suggested, no field");
+        let legacy: Evidence = serde_json::from_str(&wire).unwrap();
+        assert!(legacy.affordances.is_empty());
+        assert_eq!(legacy.id, plain.id);
+
+        let mut with = plain.clone();
+        with.affordances = vec![Affordance::new("web_audio_compare", "compare it with the rebuild")];
+        assert!(with.verify(), "a suggestion is not content: the id still verifies");
+        let s = serde_json::to_string(&with).unwrap();
+        let back: Evidence = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, with);
+        assert_eq!(back.affordances[0].tool, "web_audio_compare");
+        assert!(back.affordances[0].needs_toolset.is_none());
     }
 
     #[test]

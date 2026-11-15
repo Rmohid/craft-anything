@@ -19,6 +19,8 @@ use crate::session::Session;
 use craft_anything_evidence::{Environment, EvidenceBuilder, ToolError};
 
 pub mod investigation_tools;
+// What a target says about sound, as typed signals (shared by the web and triage tools).
+pub mod audio_signals;
 // Readable Markdown/HTML investigation reports from findings + evidence.
 pub mod native_annotate;
 pub mod native_common;
