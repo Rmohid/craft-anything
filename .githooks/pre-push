@@ -1,0 +1,5 @@
+#!/bin/sh
+# Re-run the sdlc-state evidence gate before a push. Skip cleanly when this
+# branch carries no STATE.md, so unrelated work is not blocked.
+ls docs/superpowers/state/*/STATE.md >/dev/null 2>&1 || exit 0
+exec python3 scripts/state-check --run
