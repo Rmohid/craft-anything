@@ -1425,9 +1425,13 @@ mod tests {
             enabled: true,
         };
         let chosen = |p: &Path| BackendOptions { command: Some(p.display().to_string()), ..Default::default() };
-        assert_eq!(program_of(&config(None), &chosen(&gone)).unwrap(), new.display().to_string(), "the same file in the newer build folder");
-        assert_eq!(program_of(&config(None), &chosen(&new)).unwrap(), new.display().to_string(), "a path that's there is used as it is");
-        let program = program_of(&config(None), &chosen(&gone)).unwrap();
+        // Looked up against an empty search path: this machine's installed apps (a `codex` inside
+        // ChatGPT.app here) must not decide what the test expects. The bare name is what a
+        // machine without the agent resolves to.
+        let here = |c: &BackendConfig, o: &BackendOptions| program_in(c, o, Some(std::ffi::OsString::new()));
+        assert_eq!(here(&config(None), &chosen(&gone)).unwrap(), new.display().to_string(), "the same file in the newer build folder");
+        assert_eq!(here(&config(None), &chosen(&new)).unwrap(), new.display().to_string(), "a path that's there is used as it is");
+        let program = here(&config(None), &chosen(&gone)).unwrap();
         assert_eq!(replaced_program(&chosen(&gone), &program), Some(gone.display().to_string()), "the gone path is named");
         assert_eq!(replaced_program(&chosen(&new), &new.display().to_string()), None, "nothing replaced");
         assert_eq!(replaced_program(&BackendOptions::default(), "codex"), None, "nothing saved");
@@ -1435,16 +1439,24 @@ mod tests {
         assert_eq!(replaced_program(&bare, "claude"), None, "a bare name found as the same agent");
         let folder = new.parent().unwrap();
         assert_eq!(replaced_program(&chosen(folder), &new.display().to_string()), None, "a saved folder that's there isn't gone");
-        assert_eq!(program_of(&config(Some("box")), &chosen(&gone)).unwrap(), gone.display().to_string(), "another computer's path isn't checked here");
-        assert_eq!(program_of(&config(None), &BackendOptions::default()).unwrap(), "codex", "nothing chosen: the usual name");
+        assert_eq!(here(&config(Some("box")), &chosen(&gone)).unwrap(), gone.display().to_string(), "another computer's path isn't checked here");
+        // With nothing chosen the agent's usual program is used. On macOS that lookup also looks
+        // inside /Applications for a `codex` shipped with an app (this machine has one in
+        // ChatGPT.app), so the expected value is the usual program as this machine resolves it —
+        // bare when there is none — never a fixed string that only holds on a clean machine.
+        let usual = here(&config(None), &BackendOptions::default()).unwrap();
+        assert!(
+            usual == "codex" || std::path::Path::new(&usual).file_name().is_some_and(|f| f.to_string_lossy().starts_with("codex")),
+            "nothing chosen: the usual name, bare or found: {usual}"
+        );
         // #467: a saved app bundle is never started; the usual name is looked up instead.
         let dir = tempfile::tempdir().unwrap();
         let bundle = dir.path().join("Codex.app");
         std::fs::create_dir_all(&bundle).unwrap();
-        assert_eq!(program_of(&config(None), &chosen(&bundle)).unwrap(), "codex", "an app bundle is not the program");
-        assert_eq!(program_of(&config(Some("box")), &chosen(&bundle)).unwrap(), bundle.display().to_string(), "another computer's path isn't checked here");
+        assert_eq!(here(&config(None), &chosen(&bundle)).unwrap(), usual, "an app bundle is not the program: the usual one is used");
+        assert_eq!(here(&config(Some("box")), &chosen(&bundle)).unwrap(), bundle.display().to_string(), "another computer's path isn't checked here");
         let bare = BackendOptions { command: Some("my-codex".into()), ..Default::default() };
-        assert_eq!(program_of(&config(None), &bare).unwrap(), "my-codex", "a bare name is left to PATH");
+        assert_eq!(here(&config(None), &bare).unwrap(), "my-codex", "a bare name is left to PATH");
     }
 
     /// The Claude desktop app's older installer names its app `claude.exe`; with its folder on

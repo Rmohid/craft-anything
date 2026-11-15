@@ -266,10 +266,15 @@ mod launch_tests {
         let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let app = dir.path().join(std::ffi::OsStr::from_bytes(b"game-\xff"));
         let other = dir.path().join("game-\u{fffd}");
-        for folder in [&app, &other] {
-            std::fs::create_dir(folder).unwrap();
-            std::fs::write(folder.join("project.godot"), "").unwrap();
+        // Only a filesystem that holds a name which isn't UTF-8 can reach this: macOS refuses to
+        // create one at all ("Illegal byte sequence"), so the case is unreachable there rather
+        // than passed. Linux runs it.
+        if std::fs::create_dir(&app).is_err() {
+            return;
         }
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join("project.godot"), "").unwrap();
+        std::fs::write(app.join("project.godot"), "").unwrap();
         let godot = Path::new("godot");
         assert_eq!(launch(&other, Some(godot)), Some((godot.into(), vec!["--path".into(), other.to_str().unwrap().into()])));
         assert_eq!(launch(&app, Some(godot)), None);
