@@ -159,6 +159,12 @@ def struct(st, root, final):
     else:
         sr = spec_reqs(spec)
 
+    plan = root / hdr.get("plan", "")
+    if not hdr.get("plan"):
+        errs.append("plan path missing from the header")
+    elif not plan.is_file():
+        errs.append(f"plan not found: {plan}")
+
     # Gap 4: the spec's requirement ids and the state's must be the same set.
     if set(sr) != set(st["req"]):
         errs.append(
@@ -212,6 +218,21 @@ def struct(st, root, final):
                         )
                 if step["kind"] != "wire":
                     errs.append(f"{rid}: W-check {wid} must have kind: wire")
+                if "--run" in step["check"]:
+                    errs.append(
+                        f"{rid}: wire step {wid} must not contain `--run` — "
+                        "it recurses; the wire check calls `--struct`"
+                    )
+        # Recursion guard for every wire step, internal rows included: a wire
+        # check that re-invokes the gate hangs the gate rather than failing it.
+        if row["w"]:
+            wstep = st["steps"].get(row["w"])
+            if wstep and wstep["kind"] == "wire" and "--run" in wstep["check"]:
+                if row["consumer"].lower() == "internal":
+                    errs.append(
+                        f"{rid}: wire step {row['w']} must not contain `--run` — "
+                        "it recurses; the wire check calls `--struct`"
+                    )
         if final and status != "covered":
             errs.append(f"{rid}: status `{status}` at final (must be covered)")
 
@@ -241,6 +262,19 @@ def struct(st, root, final):
             errs.append(f"ledger not found: {ledger_path}")
     else:
         errs.append("ledger path missing from the header")
+
+    # Resume/ledger coherence (F9): the gate's own receipt must name one sha.
+    if ledger:
+        final_green = re.findall(r"FINAL-GREEN\s*\|\s*([0-9a-f]{7,40})", ledger)
+        if final_green:
+            raw = st["path"].read_text(encoding="utf-8", errors="replace") \
+                if st["path"] and st["path"].is_file() else ""
+            last_green = re.search(r"^-\s+last-green:\s*(\S+)", raw, re.M)
+            if last_green and last_green.group(1) != final_green[-1]:
+                errs.append(
+                    f"last-green {last_green.group(1)} != FINAL-GREEN "
+                    f"{final_green[-1]} — sync Resume with the ledger"
+                )
 
     if not st["steps"]:
         errs.append("no steps")
@@ -290,19 +324,63 @@ def shell(cmd, root):
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
+def _expect_hit(step, out):
+    """Did a step's `expect` pass against the check's output?"""
+    expect = step["expect"]
+    if expect == "exit 0":
+        return True
+    if expect.startswith("`") and expect.endswith("`"):
+        return tick(expect) in out
+    return tick(expect) in out
+
+
 def run(st, root):
-    """Re-execute evidence: every mapped test and every wire check."""
+    """Re-execute evidence: every [x] step's check, every mapped test, every wire check."""
     errs = []
+    name = pathlib.Path(st["path"]).parent.name if st["path"] else "?"
     test_cmd = st["hdr"].get("test_cmd", "").strip()
+
+    # S-steps are the state machine; evidence strings are self-attested prose
+    # until the check is re-executed. Re-run every done step and hold it to its
+    # declared expect. A check that invokes the gate itself (S06/S10/S13's
+    # `state-check ...`) is the gate's own receipt, not evidence to re-run in
+    # the S-loop — executing it would recurse without bound. Wire steps still
+    # re-run via the wire loop below; finish/review steps that invoke the gate
+    # remain self-attested by construction (the outer --run --final IS them).
+    for sid in st["order"]:
+        step = st["steps"][sid]
+        if step["mark"] != "x":
+            continue
+        cmd = tick(step["check"])
+        if cmd == "true" or "scripts/state-check" in cmd:
+            continue
+        # Wire steps re-run below via the wire loop; running them here too
+        # would execute stateful checks (e.g. a localhost server) twice.
+        # (The localhost-server check is itself racy: its trailing `kill` can
+        # exit nonzero when the server exited first — see audio S05.)
+        if step["kind"] == "wire":
+            continue
+        code, out = shell(cmd, root)
+        if code != 0:
+            errs.append(
+                f"{sid}: check `{cmd}` exited {code} (recorded as exit 0): "
+                f"{out.strip()[-120:]}"
+            )
+        elif not _expect_hit(step, out):
+            errs.append(
+                f"{sid}: check `{cmd}` output lacks expect `{tick(step['expect'])}`: "
+                f"{out.strip()[-120:]}"
+            )
+
     for rid, row in st["req"].items():
         if row["status"] == "planned":
             continue
         for ref in row["tests"]:
-            path_part, _, name = ref.partition("::")
+            path_part, _, ref_name = ref.partition("::")
             if not test_cmd:
                 errs.append(f"{rid}: no test_cmd in the header, cannot run {ref}")
                 break
-            cmd = test_cmd.format(ref=ref, path=path_part, name=name)
+            cmd = test_cmd.format(ref=ref, path=path_part, name=ref_name)
             code, out = shell(cmd, root)
             if code != 0:
                 errs.append(f"{rid}: `{cmd}` exited {code}: {out.strip()[-300:]}")
@@ -310,12 +388,12 @@ def run(st, root):
         if step and step["check"]:
             cmd = tick(step["check"])
             code, out = shell(cmd, root)
-            expect = step["expect"]
             if code != 0:
                 errs.append(f"{rid}: wire {row['w']} `{cmd}` exited {code}: {out.strip()[-300:]}")
-            elif expect.startswith("`") and tick(expect) not in out:
+            elif not _expect_hit(step, out):
                 errs.append(
-                    f"{rid}: wire {row['w']} output lacks `{tick(expect)}`: {out.strip()[-300:]}"
+                    f"{rid}: wire {row['w']} output lacks `{tick(step['expect'])}`: "
+                    f"{out.strip()[-300:]}"
                 )
     return errs
 

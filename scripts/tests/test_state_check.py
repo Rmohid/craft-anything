@@ -158,7 +158,7 @@ class TestStruct(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("ok (1 state file)", r.stdout)
 
-    def test_good_project_passes_final(self):
+    def test_good_project_final(self):
         r = self.p.run("--struct", "--final")
         self.assertEqual(r.returncode, 0, r.stderr)
 
@@ -234,6 +234,14 @@ class TestStruct(Base):
             "| T1 | none |  | R1 | open |",
         )
         self.assertFinding(self.p.run("--struct"), "needs a reason")
+
+    def test_missing_plan_file(self):
+        (self.p.dir / "docs/superpowers/plans/demo.md").unlink()
+        self.assertFinding(self.p.run("--struct"), "plan not found")
+
+    def test_missing_ledger_at_final(self):
+        (self.p.dir / "docs/superpowers/progress.md").unlink()
+        self.assertFinding(self.p.run("--struct", "--final"), "ledger not found")
 
     def test_done_without_evidence(self):
         self.p.patch(
@@ -363,6 +371,38 @@ class TestRun(Base):
         r = self.p.run("--run")
         self.assertEqual(r.returncode, 1)
         self.assertIn("output lacks `2 items`", r.stderr)
+
+    def test_run_catches_fabricated_s_step(self):
+        # An [x] step's recorded evidence is self-attested until --run
+        # re-executes its check. Break S01's check; the gate must fail.
+        self.p.patch(
+            "docs/superpowers/state/demo/STATE.md",
+            "- check: `python3 tests/test_sync.py -q test_a`",
+            "- check: `false`",
+        )
+        r = self.p.run("--run")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("S01", r.stderr)
+
+    def test_struct_rejects_recursive_wire_check(self):
+        self.p.patch(
+            "docs/superpowers/state/demo/STATE.md",
+            "- check: `./tool sync`",
+            "- check: `python3 scripts/state-check --run`",
+        )
+        self.assertFinding(self.p.run("--struct"), "must not contain `--run`")
+
+    def test_resume_last_green_must_match_final_green(self):
+        self.p.write(
+            "docs/superpowers/progress.md",
+            LEDGER + "2026-11-15 03:00 | - | FINAL-GREEN | deadbee | ok |\n",
+        )
+        self.p.patch(
+            "docs/superpowers/state/demo/STATE.md",
+            "- next: S01",
+            "- next: none\n- last-green: 3f2a1c9",
+        )
+        self.assertFinding(self.p.run("--struct"), "last-green")
 
 
 class TestDoctor(Base):
