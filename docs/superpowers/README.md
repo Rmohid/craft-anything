@@ -15,6 +15,9 @@ about three steps. It keeps `STATE.md` as the single source of truth, maps every
 requirement to a test that is re-run, and requires a consumer-facing requirement to name
 an entry point that is exercised unmocked.
 
+The skill is installed at `~/.agents/skills/sdlc-state` (opencode loads `~/.agents/skills`).
+`scripts/state-check` here is a byte-identical copy of that skill's `scripts/state-check`.
+
 The mechanical gate is `scripts/state-check`:
 
 ```sh
@@ -24,5 +27,7 @@ python3 scripts/state-check --run --final   # before finishing a branch
 python3 scripts/state-check doctor          # are the hooks still installed?
 ```
 
-The Stop hook, the pre-push hook and the CI job call the same checker. A `[x]` step
-without evidence fails `--struct`; only `--run` re-executes the evidence.
+The pre-push hook and the CI job call the same checker; those two are the gates `doctor`
+requires. The Stop hook in `.claude/settings.json` is a Claude Code convenience only, so
+`doctor` does not require it. A `[x]` step without evidence fails `--struct`; only `--run`
+re-executes the evidence.

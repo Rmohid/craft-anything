@@ -321,13 +321,14 @@ def run(st, root):
 
 
 def doctor(root):
-    """The gates must still be installed; otherwise the gate quietly uninstalls itself."""
-    errs = []
+    """The gates must still be installed; otherwise the gate quietly uninstalls itself.
 
-    settings = root / ".claude" / "settings.json"
-    if not settings.is_file() or "state-check" not in settings.read_text(
-            encoding="utf-8", errors="replace"):
-        errs.append("Stop hook missing: .claude/settings.json does not mention state-check")
+    Only harness-neutral gates count. The Stop hook in `.claude/settings.json` is
+    a Claude Code convenience: it fires only when that harness runs, so a project
+    driven by another agent would report a green gate that can never fire. It is
+    therefore not required here, and its absence is not a finding.
+    """
+    errs = []
 
     hooks_path = subprocess.run(
         ["git", "config", "core.hooksPath"], cwd=str(root),
