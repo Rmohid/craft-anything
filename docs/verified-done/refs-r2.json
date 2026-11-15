@@ -1,0 +1,6 @@
+{
+  "item": "R2",
+  "input": "docs/superpowers/specs/2026-11-15-sdlc-state-design.md",
+  "requirement": "Spec requirement IDs and STATE REQ IDs are the same set (spec bytes)",
+  "sha256": "4fca8fdb6fdbe8f40ec17d23e537b84af083d138a0ecba112140e12259015e27"
+}

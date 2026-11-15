@@ -1,0 +1,6 @@
+{
+  "item": "R1",
+  "input": "scripts/state-check",
+  "requirement": "A valid STATE.md parses; a done step without evidence fails (checker binary)",
+  "sha256": "f504b25582d58dec49938d6a8ec5485c3af9f3c864b55201493e5ce14c6513c6"
+}

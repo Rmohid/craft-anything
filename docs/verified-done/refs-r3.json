@@ -1,0 +1,6 @@
+{
+  "item": "R3",
+  "input": "scripts/tests/test_state_check.py",
+  "requirement": "A consumer-facing REQ has a wire step that invokes its declared entry (test suite)",
+  "sha256": "d79070d2995297ddef1300c724d679c78e06ed7e8fdc82a7ec6a89842fc5fd5b"
+}

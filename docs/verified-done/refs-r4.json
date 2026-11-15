@@ -1,0 +1,6 @@
+{
+  "item": "R4",
+  "input": "docs/superpowers/plans/2026-11-15-sdlc-state.md",
+  "requirement": "The gate runs through its real entry and reports findings (plan bytes)",
+  "sha256": "37af298e48907624999047173b086e66c341a29cd18445e6ab3f6c310d3df69c"
+}
