@@ -378,6 +378,69 @@ fn walkthrough_starts_with_given_storage_and_never_echoes_it() {
     assert!(run(json!({"session_storage": [{"origin": "ftp://x", "entries": {"a": "b"}}]})).unwrap_err().message.contains("http(s)"));
 }
 
+/// An ego-style `page.cdp("Storage.getCookies")` export maps to `storage.cookies` by the
+/// documented rules (see `StartingCookie`): camelCase `httpOnly`/`sameSite` become snake_case,
+/// `domain` + `path` + `sourceScheme`/`secure` + `sourcePort` synthesise `url` (the leading `.`
+/// is stripped, default ports are omitted, `path` is kept), `expires`/`session`/`priority`/`size`
+/// are dropped (the cookie becomes session-scoped for the run). Values are secrets: they are
+/// seeded but never echoed. The export must be filtered to the site first; `storage.cookies`
+/// caps at 200.
+#[test]
+fn exported_cookies_map_to_starting_storage_and_never_echo_their_values() {
+    use crate::tools::web_common::Secrets;
+    // Ego shape (CDP Network.Cookie), values are fake test data, never real secrets.
+    let exported = json!({
+        "cookies": [
+            {"name": "sid", "value": "cookie-VALUE-9", "domain": ".example.com", "path": "/app",
+             "expires": 1893456000.0, "httpOnly": true, "secure": true, "sameSite": "Lax",
+             "priority": "Medium", "session": false, "sourceScheme": "Secure", "sourcePort": 443},
+            {"name": "pref", "value": "pref-VALUE-3", "domain": "www.example.com", "path": "",
+             "httpOnly": false, "secure": false, "sourceScheme": "Unsecure", "sourcePort": 8080}
+        ]
+    });
+    // The documented mapping, applied here exactly as the StartingCookie docs describe.
+    let mapped = json!({
+        "cookies": [
+            {"url": "https://example.com/app", "name": "sid", "value": "cookie-VALUE-9", "http_only": true, "secure": true, "same_site": "Lax"},
+            {"url": "http://www.example.com:8080/", "name": "pref", "value": "pref-VALUE-3", "http_only": false, "secure": false}
+        ],
+        "local_storage": [],
+        "session_storage": []
+    });
+    // Secrets redaction covers the exported values in every encoding.
+    let values: Vec<String> = exported["cookies"].as_array().unwrap().iter().filter_map(|c| c["value"].as_str().map(str::to_string)).collect();
+    let mut secrets = Secrets::new(&values);
+    assert_eq!(secrets.text("sid=cookie-VALUE-9"), "sid=«redacted»");
+    assert!(!secrets.text(&mapped.to_string()).contains("cookie-VALUE-9"));
+
+    let (url, _) = fake_cdp();
+    let e = Engine::new(crate::testing::session());
+    let v = e
+        .call(
+            "web_walkthrough_record",
+            json!({"cdp_endpoint": url, "actions": [{"kind": "wait", "ms": 1}], "storage": mapped}),
+            CallOptions::new(Caller::Mcp).with_consent(crate::Consent::Granted),
+        )
+        .map(|o| o.to_json())
+        .unwrap();
+    let seeded = &v["result"]["starting_storage"];
+    assert_eq!(seeded["cookies_set"], json!(["sid", "pref"]));
+    assert_eq!(seeded["failed"], json!([]));
+    let text = v.to_string();
+    assert!(!text.contains("cookie-VALUE-9") && !text.contains("pref-VALUE-3"), "exported values are never echoed");
+    // The cap is enforced before anything is set.
+    let many = json!({"cookies": (0..201).map(|i| json!({"url": "https://app.test/", "name": format!("c{i}"), "value": "v"})).collect::<Vec<_>>()});
+    let err = e
+        .call(
+            "web_walkthrough_record",
+            json!({"cdp_endpoint": url, "actions": [{"kind": "wait", "ms": 1}], "storage": many}),
+            CallOptions::new(Caller::Mcp).with_consent(crate::Consent::Granted),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadInput);
+    assert!(err.message.contains("at most 200"), "{}", err.message);
+}
+
 #[test]
 fn walkthrough_records_artifacts_after_steps_and_at_the_end() {
     let (url, _) = fake_cdp();
@@ -423,6 +486,21 @@ fn walkthrough_keeps_network_from_every_step() {
     assert!(urls.iter().any(|u| u.contains("/api/items")), "the request from before the goto: {urls:?}");
     assert!(urls.iter().any(|u| u.contains("/after-goto")), "the request from the goto itself: {urls:?}");
     assert!(v["result"]["events"].is_null(), "no families asked for");
+}
+
+#[test]
+fn walkthrough_evidence_names_the_visited_site_not_the_starting_tab() {
+    // The picked tab starts on https://app.test/; the goto takes the page to /home.
+    // The evidence must name the site the run actually examined, not the tab it started on.
+    let (url, _) = fake_cdp();
+    let e = Engine::new(crate::testing::session());
+    let v = walkthrough(&e, json!({"cdp_endpoint": url, "actions": [{"kind": "goto", "url": "https://app.test/after-goto", "wait_ms": 50}]})).unwrap();
+    assert_eq!(v["result"]["start_url"], "https://app.test/", "the starting tab is still recorded");
+    let step_url = v["result"]["steps"][0]["url"].as_str().unwrap().to_string();
+    assert_ne!(step_url, "https://app.test/", "the run navigated");
+    assert_eq!(v["subject"]["name"].as_str().unwrap(), step_url, "the evidence names the visited site");
+    assert_eq!(v["locations"][0]["value"].as_str().unwrap(), step_url);
+    assert!(v["summary"].as_str().unwrap().contains(&step_url), "{}", v["summary"]);
 }
 
 #[test]

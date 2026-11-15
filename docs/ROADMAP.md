@@ -1019,7 +1019,13 @@ Owner: open · Status: in progress
       `null`; setup and the builder now approve our tools for Codex (we still ask before running
       code) and a refusal explains the fix (`docs/codex.md`)
 - [ ] Codex (#540): run `codex exec` on a real install and check `rebuild_start` gets through
-- [ ] Codex: resume support (`codex exec resume <id>`), verified on a real install
+- [x] Codex: resume support (`codex exec resume <id>`), verified on a real install
+      — claimed: Codex, branch feature/r2.2-codex-resume (local workspace)
+      — verified on macOS with Codex 0.169.0-alpha.11.1: MCP call, sandboxed file write,
+        follow-up and reopened thread through `codex_resume_smoke`; not a full rebuild
+      — missing-thread stderr clears the unavailable session; parser and runner recovery
+        regressions cover it. Resume argument order on older Codex releases is unverified
+      — refuse `--ephemeral` before startup; two-turn regression checks that no session is saved
 - [ ] Aider: move the message to `--message-file` once the launcher can write one (see the argv item above).
 - [x] Aider: read project-folder `.aider.conf.yml` and `.env` in `check_setup`, which needs the working directory passed into `check_native_options`.
       It reads the run's folder, the top of its git repository, then the home folder, as Aider
@@ -1713,7 +1719,8 @@ Owner: open · Status: todo
 
 ### R3.9 Game assets out
 Owner: open · Status: in progress
-- [ ] Unity: sounds out (the stored stream, usually FSB5; PCM ones as WAV)
+- [x] Unity: sounds out (the stored stream, usually FSB5; PCM ones as WAV)
+      — claimed: NicolasBohn, branch feature/r3.9-unity-sounds
 - [ ] Unity: crunched textures (DXT1Crunched, DXT5Crunched; two of the games checked use them)
 - [x] Unity: decode R16 and RG16 texture pixels through the shared bounded PNG export path.
       — claimed: Afloat16, branch feature/r3.9-unity-integer-textures-20261109
@@ -2777,6 +2784,26 @@ Owner: open · Status: in progress
       template only real calendar dates in API paths (#602–#605, by Afloat16)
 - [x] Preserve empty query pairs when matching older stand-in recordings, without treating raw
       query separators as pairs — claimed: Afloat16, branch `bugfix/r3.13-preserve-empty-query-pairs-20261103`
+- [x] Attach website tools to a person's signed-in browser through a CDP endpoint
+      (`web_site_open browser=attached` plus `web_browser_connect`), Deep only — Clean room
+      refuses attached before anything launches, the endpoint must be literal loopback, and the
+      external browser is never launched or killed.
+      — claimed: Robert Mohid, branch feature/ego-cdp-attach
+- [x] Exported-cookie mapping is documented and attached browser options are guarded: cookies from
+      `Storage.getCookies` seed a private session and are never echoed (names only).
+      — claimed: Robert Mohid, branch feature/ego-cdp-attach
+- [x] A walkthrough's evidence is named after the site the run visited, not the tab it started on
+      (`about:blank` for a launched browser).
+      — claimed: Robert Mohid, branch feature/ego-cdp-attach
+- [ ] Attached mode is unavailable when no chromium engine is locatable, because `web_site_open`
+      keeps `Requires::Engine("chromium")` even though attached mode never launches a browser.
+      Give attached its own availability path so any CDP endpoint works.
+- [ ] A walkthrough's `start_url` is sanitised but never secret-scrubbed: with zero steps (or all
+      history calls failing) a token in the start URL leaks into the evidence subject, summary and
+      location. Build `Secrets` before `start_url` or scrub the final URL once, with a test.
+- [ ] Live-proof the attached Endel capture end to end: 30 s from the signed-in ego browser
+      while Focus plays — graph, spectrum, mixer snapshot, nothing secret in the evidence
+      (`web_audio_offline_render`, fingerprint and compare already prove live).
 
 ---
 

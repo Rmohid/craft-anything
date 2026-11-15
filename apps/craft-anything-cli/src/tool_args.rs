@@ -351,6 +351,25 @@ mod tests {
     }
 
     #[test]
+    fn attached_browser_options_are_cli_flags() {
+        let r = Registry::with_all_tools();
+        let open = r.get("web_site_open").unwrap();
+        let h = help(open);
+        assert!(h.contains("--browser"), "{h}");
+        assert!(h.contains("--cdp-endpoint"), "{h}");
+        let inv = parse(
+            open,
+            &["--url".into(), "https://example.com".into(), "--browser".into(), "attached".into(), "--cdp-endpoint".into(), "http://127.0.0.1:9222".into()],
+        )
+        .unwrap();
+        assert_eq!(inv.params["browser"], json!("attached"));
+        assert_eq!(inv.params["cdp_endpoint"], json!("http://127.0.0.1:9222"));
+        // Defaults preserve the private browser.
+        let inv = parse(open, &["--url".into(), "https://example.com".into()]).unwrap();
+        assert!(inv.params.get("browser").is_none(), "{}", inv.params);
+    }
+
+    #[test]
     fn an_evidence_input_takes_a_bare_id_or_an_object() {
         let r = Registry::with_all_tools();
         let spec = r.get("runtime_captures_compare").unwrap();
