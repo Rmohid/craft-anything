@@ -1,0 +1,8 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Shop</title></head>
+<body><main><h1>Shop</h1><p>We value your privacy.</p></main>
+<script>
+// what a browser fingerprinting script does: an offline context, nothing audible
+const probe = new OfflineAudioContext(1, 44100, 44100);
+const o = probe.createOscillator(); o.connect(probe.destination); o.start();
+probe.startRendering();
+</script></body></html>

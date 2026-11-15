@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Pad</title>
+<style>body{font-family:system-ui;margin:0;background:#0f1216;color:#e8eef5}
+main{max-width:640px;margin:0 auto;padding:48px 24px}h1{font-size:32px}</style></head>
+<body><main>
+<h1>Focus</h1>
+<p>A slow pad, two layers, one low-pass filter.</p>
+<button id="play" aria-label="Play">Play</button>
+<p id="state">paused</p>
+</main>
+<script>
+const ctx = new (window.AudioContext || window.webkitAudioContext)();
+const pad = ctx.createOscillator(); pad.type = 'sine'; pad.frequency.value = 220;
+const bass = ctx.createOscillator(); bass.type = 'triangle'; bass.frequency.value = 110;
+const filter = ctx.createBiquadFilter(); filter.type = 'lowpass'; filter.frequency.value = 800;
+const gain = ctx.createGain(); gain.gain.value = 0.2;
+const analyser = ctx.createAnalyser(); analyser.fftSize = 8192; analyser.smoothingTimeConstant = 0;
+pad.connect(filter); bass.connect(filter); filter.connect(gain); gain.connect(analyser); analyser.connect(ctx.destination);
+window.__craftAnythingAudioContext = ctx;
+document.getElementById('play').addEventListener('click', () => { ctx.resume(); pad.start(); bass.start(); document.getElementById('state').textContent = 'playing'; });
+</script></body></html>

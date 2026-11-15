@@ -2226,3 +2226,26 @@ fn offline_render_refuses_recipes_outside_its_bounds_before_touching_a_browser()
         assert_eq!(err.code, expected, "{params}: {}", err.message);
     }
 }
+
+/// R4 of the unprompted-choice design: a model reads one sentence per tool, so the audio tools
+/// lead with the situation ("measure the sound a page is playing") rather than the mechanism
+/// ("fingerprint a capture"), which is what a model has to recognise to reach for them.
+#[test]
+fn the_audio_tools_say_what_they_are_for_before_how_they_work() {
+    let specs = super::specs();
+    let summary = |id: &str| specs.iter().find(|s| s.id == id).map(|s| s.summary).unwrap_or_default();
+    assert!(summary("web_audio_capture").starts_with("Measure the sound a web page is playing right now"), "{}", summary("web_audio_capture"));
+    assert!(summary("web_audio_fingerprint").starts_with("Record what a web page's sound is like"), "{}", summary("web_audio_fingerprint"));
+    assert!(summary("web_audio_compare").starts_with("Measure whether a rebuilt sound matches the original"), "{}", summary("web_audio_compare"));
+    assert!(summary("web_audio_offline_render").starts_with("Render a rebuild's sound recipe"), "{}", summary("web_audio_offline_render"));
+}
+
+/// R4's edge: leading with the situation must not drop the thing that decides whether a model may
+/// call it at all — that it needs approval and Deep mode.
+#[test]
+fn the_audio_capture_still_says_it_needs_approval_and_deep_mode() {
+    let specs = super::specs();
+    let summary = specs.iter().find(|s| s.id == "web_audio_capture").map(|s| s.summary).unwrap_or_default();
+    assert!(summary.contains("needs your approval and Deep mode"), "{summary}");
+    assert!(summary.contains("no audio is recorded"), "the data-minimisation promise stays in the description: {summary}");
+}
