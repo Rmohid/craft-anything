@@ -14,9 +14,9 @@ beads: off
 
 ## Resume
 
-- next: S13
-- last-green: 68363266
-- in-flight: S01-S12 done; S13 final gate next
+- next: none
+- last-green: f56f45ef
+- in-flight: none; S01-S13 done and `--run --final` green
 - blockers: none
 - do-not: never put `--run` in a wire check; it recurses. The wire check calls `--struct`.
 
@@ -47,13 +47,13 @@ beads: off
   - expect: `1`
   - evidence: 68363266 · 2026-11-15 02:15 · exit 0 · "1"
 - [x] S03 Install the personal skill | kind: build | req: R1 | est: 15m
-  - check: `test -f "$HOME/.claude/skills/sdlc-state/SKILL.md" && grep -q '^name: sdlc-state' "$HOME/.claude/skills/sdlc-state/SKILL.md"; echo $?`
+  - check: `test -f "$HOME/.agents/skills/sdlc-state/SKILL.md" && grep -q '^name: sdlc-state' "$HOME/.agents/skills/sdlc-state/SKILL.md"; echo $?`
   - expect: `0`
-  - evidence: 68363266 · 2026-11-15 02:15 · exit 0 · "exit 0 (skill file present)"
+  - evidence: b5fd1030 · 2026-11-15 01:16 · exit 0 · "exit 0 (skill file present at ~/.agents)"
 - [x] S04 Vendor state-check and its tests | kind: build | req: R1 | est: 15m
-  - check: `cmp -s scripts/state-check "$HOME/.claude/skills/sdlc-state/scripts/state-check"; echo $?`
+  - check: `cmp -s scripts/state-check "$HOME/.agents/skills/sdlc-state/scripts/state-check"; echo $?`
   - expect: `0`
-  - evidence: 68363266 · 2026-11-15 02:15 · exit 0 · "exit 0 (cmp identical)"
+  - evidence: b5fd1030 · 2026-11-15 01:16 · exit 0 · "exit 0 (cmp identical at ~/.agents)"
 - [x] S05 Write the plan | kind: plan | req: - | est: 20m
   - check: `test -f docs/superpowers/plans/2026-11-15-sdlc-state.md; echo $?`
   - expect: `0`
