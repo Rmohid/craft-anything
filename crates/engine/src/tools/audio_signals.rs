@@ -81,9 +81,21 @@ impl Signal {
     }
 }
 
-/// Tokens that only a real Web Audio graph has. `AudioContext` alone is too common (feature
-/// detection, polyfills), so a constructor call or an oscillator is required.
-const WEBAUDIO_TOKENS: [&str; 5] = ["new AudioContext", "new webkitAudioContext", "createOscillator(", "createAudioWorkletNode(", "audioWorklet.addModule("];
+/// Tokens that only a real-time Web Audio graph has. The context is the discriminator, not the
+/// nodes: a browser fingerprinting script also calls `createOscillator` on its
+/// `OfflineAudioContext` to render a probe tone, so an oscillator alone says nothing (found live
+/// on a fingerprinting fixture, 2026-11-14). A worklet module is decisive too: it is loaded by a
+/// running graph, never by a one-off render.
+const WEBAUDIO_TOKENS: [&str; 8] = [
+    "new AudioContext",
+    "new webkitAudioContext",
+    "new window.AudioContext",
+    "new(window.AudioContext",
+    "new (window.AudioContext",
+    "new(AudioContext",
+    "new (AudioContext",
+    "audioWorklet.addModule(",
+];
 
 /// The token browser fingerprinting scripts use, and nothing else in a page that makes music.
 const OFFLINE_TOKEN: &str = "OfflineAudioContext";
@@ -213,10 +225,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_live_graph_is_recognised_by_a_constructor_or_an_oscillator() {
+    fn a_live_graph_is_recognised_by_its_context() {
         assert_eq!(scan_script("app.js", "const c = new AudioContext();").len(), 1);
-        assert_eq!(scan_script("app.js", "c.createOscillator()")[0].kind, Kind::WebAudioCtor);
-        assert_eq!(scan_script("app.js", "new webkitAudioContext"), vec![Signal::new(Kind::WebAudioCtor, "app.js")]);
+        assert_eq!(scan_script("app.js", "new webkitAudioContext")[0].kind, Kind::WebAudioCtor);
+        // Minified, with no space after `new`.
+        assert_eq!(scan_script("app.js", "new(window.AudioContext||window.webkitAudioContext)()")[0].kind, Kind::WebAudioCtor);
+        assert_eq!(scan_script("app.js", "ctx.audioWorklet.addModule('worklet.js')")[0].kind, Kind::WebAudioCtor);
+    }
+
+    /// Found live, 2026-11-14: a fingerprinting script renders a probe tone with
+    /// `createOscillator` on an `OfflineAudioContext`. An oscillator is not a music page.
+    #[test]
+    fn a_fingerprinting_script_that_renders_a_tone_is_still_not_a_music_page() {
+        let s = scan_script(
+            "fp.js",
+            "const p = new OfflineAudioContext(1, 44100, 44100); const o = p.createOscillator(); o.connect(p.destination); o.start(); p.startRendering();",
+        );
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].kind, Kind::OfflineCtxOnly);
+        assert!(affordances(&s, false).is_empty());
     }
 
     #[test]

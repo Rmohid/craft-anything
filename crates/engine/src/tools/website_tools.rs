@@ -878,6 +878,10 @@ const LAYOUT_JS: &str = r#"(() => {
 /// The page's own media elements, as tags (`audio`, `video`), capped.
 const MEDIA_ELEMENTS_JS: &str = r#"Array.from(document.querySelectorAll('audio,video')).slice(0, 8).map(e => e.tagName.toLowerCase())"#;
 
+/// The page's own inline scripts, concatenated and capped. A small page often builds its audio
+/// graph in one, and it has no URL to fetch, so it would otherwise be invisible.
+const INLINE_SCRIPTS_JS: &str = r#"Array.from(document.scripts).filter(s => !s.src).map(s => s.textContent || '').join('\n').slice(0, 262144)"#;
+
 /// What the page says about sound: its media elements, the scripts it lists (Deep mode only) and
 /// the sound files it loaded (Deep mode only). Clean room reads what a visitor sees, so it sees
 /// the elements and nothing about the page's code or requests, and the coverage sentence says so.
@@ -892,8 +896,15 @@ fn probe_audio(client: &mut CdpClient, blueprint: &Value, visitor: bool, dl: &De
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(Value::as_str).take(audio_signals::SCRIPT_COUNT).map(str::to_string).collect())
         .unwrap_or_default();
-    let total = blueprint.pointer("/assets/scripts").and_then(Value::as_array).map_or(0, Vec::len);
-    let (read, unread) = read_scripts(client, &listed, dl);
+    let listed_count = blueprint.pointer("/assets/scripts").and_then(Value::as_array).map_or(0, Vec::len);
+    let (mut read, unread) = read_scripts(client, &listed, dl);
+    // Inline scripts carry no URL: read the page's own text, bounded, and scan it as one script.
+    let inline = eval(client, INLINE_SCRIPTS_JS, dl).ok().and_then(|v| v.as_str().map(str::to_string)).filter(|t| !t.trim().is_empty());
+    if let Some(text) = &inline {
+        read.push(("inline".to_string(), text.chars().take(audio_signals::SCRIPT_BYTES).collect::<String>()));
+    }
+    // What the look reached: the script sources the page named, plus its own inline script.
+    let total = listed_count + usize::from(inline.is_some());
     let requests: Vec<&str> =
         blueprint.pointer("/assets/requests").and_then(Value::as_array).into_iter().flatten().filter_map(|r| r.get("url").and_then(Value::as_str)).collect();
     let p = audio_signals::from_observation(&tags, &read, total, &requests, false, unread);
