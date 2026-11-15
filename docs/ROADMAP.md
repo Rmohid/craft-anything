@@ -2805,12 +2805,20 @@ Owner: open · Status: in progress
       summaries for the four audio tools; and Clean room offering `clean_room::TOOLS ∩ registry` so
       the Clean-room-allowed fingerprint/compare are reachable there at all.
       — claimed: opencode-agent, branch `feature/r3.13-unprompted-audio-choice`
-- [ ] Prove unprompted choice with a two-run smoke test (one control, one patched; pass: an audio
-      tool within 4 turns after the first `web_site_capture` result in the patched run and not in
-      the control). Gated: it spends the app's model keys rather than the batch budget, so it runs
-      only on a sized estimate and an explicit go-ahead. A pass rate is a later question, asked
-      when something depends on it. `core_target_triage` gains `audio_evidence` when it holds a
-      file inventory to read.
+- [x] Prove unprompted choice with a two-run smoke test (control = the code before this work,
+      patched = with it; the real builder on a loopback page that builds its audio graph in an
+      inline script). Result: **neither arm called an audio tool.** Both rebuilt the same graph
+      (220/110 oscillators, lowpass 800, analyser 8192) by reading the page's source, which Deep
+      mode allows; the control even reported that it "couldn't listen to the sound" while shipping
+      an identical graph. The patched run's evidence record carried the `web_audio_capture`
+      affordance, but the builder works from the capture folder and never read that record.
+      Negative with a named cause, not a mechanism failure.
+- [ ] Revisit the affordance when a page's sound can be captured but not read: today the only
+      pages that need measuring are the ones capture cannot reach (Deep mode reads the recipe,
+      Clean room cannot capture at all, and a module-scoped graph has no reachable context until
+      the hidden-graph line above lands). Until then, say plainly that the audio tools need a
+      person to name them. `core_target_triage` gains `audio_evidence` when it holds a file
+      inventory to read.
 - [ ] Live-proof the attached Endel capture end to end: 30 s from the signed-in ego browser
       while Focus plays — graph, spectrum, mixer snapshot, nothing secret in the evidence
       (`web_audio_offline_render`, fingerprint and compare already prove live).
