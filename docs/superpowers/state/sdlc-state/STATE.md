@@ -76,7 +76,7 @@ beads: off
   - evidence: 68363266 · 2026-11-15 02:15 · exit 0 · "exit 0 (state-check in state.yml)"
 - [x] S10 WIRING-E2E: run the gate through its real entry | kind: wire | req: R4 | est: 10m
   - check: `python3 scripts/state-check --struct`
-  - expect: exit 0
+  - expect: `state-check 1.0.0: ok (1 state file)`
   - evidence: 68363266 · 2026-11-15 02:15 · exit 0 · "state-check 1.0.0: ok (1 state file)"
 - [x] S11 ROUTING: index the skill in AGENTS.md and docs/superpowers/README.md | kind: route | req: - | est: 10m
   - check: `grep -q 'sdlc-state' AGENTS.md && grep -q 'sdlc-state' docs/superpowers/README.md; echo $?`
