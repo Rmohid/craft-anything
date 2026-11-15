@@ -61,9 +61,9 @@ beads: off
   - expect: `test result: ok`
   - evidence: 16f32026 · 2026-11-14 20:52 · exit 0 · "test result: ok. 1 passed"
 - [x] S05 Wire: the capture's own entry reports the signal | kind: wire | req: R1 | est: 10m
-  - check: `d=$(mktemp -d); python3 -m http.server 8747 --bind 127.0.0.1 --directory docs/superpowers/fixtures/audio-choice >/dev/null 2>&1 & srv=$!; sleep 1; { printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"gate"}}}' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"web_site_open","arguments":{"url":"http://127.0.0.1:8747/audio.html"}}}'; printf '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"web_site_capture","arguments":{"output_directory":"%s/capture","widths":[1280]}}}\n' "$d"; } | cargo run -q -p craft-anything-cli -- --deep --allow-run mcp --all-tools | grep -c webaudio_ctor; kill $srv`
+  - check: `d=$(mktemp -d); port=$((20000 + $$ % 10000)); python3 -m http.server $port --bind 127.0.0.1 --directory docs/superpowers/fixtures/audio-choice >/dev/null 2>&1 & srv=$!; for i in $(seq 1 50); do curl -sf -o /dev/null "http://127.0.0.1:$port/audio.html" && break; sleep 0.2; done; n=$({ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"gate"}}}' "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"web_site_open\",\"arguments\":{\"url\":\"http://127.0.0.1:$port/audio.html\"}}}"; printf '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"web_site_capture","arguments":{"output_directory":"%s/capture","widths":[1280]}}}\n' "$d"; } | cargo run -q -p craft-anything-cli -- --deep --allow-run mcp --all-tools | grep -c webaudio_ctor); kill $srv 2>/dev/null; echo $n`
   - expect: `1`
-  - evidence: ff9bac64 · 2026-11-14 21:20 · exit 0 · "1"
+  - evidence: e6f00f83 · 2026-11-15 02:00 · exit 0 · "1"
 - [x] S06 Build Clean-room offering by permission, not toolset | kind: build | req: R3 | est: 30m
   - check: `cargo test --workspace --lib clean_room_offers_the_audio_tools`
   - expect: `test result: ok`
@@ -83,7 +83,7 @@ beads: off
 - [x] S10 Build the context discriminator and inline-script reading | kind: build | req: R5 | est: 30m
   - check: `cargo test --workspace --lib a_fingerprinting_script_that_renders_a_tone`
   - expect: `test result: ok`
-  - evidence: ff9bac64 · 2026-11-14 21:11 · exit 0 · "test result: ok. 1 passed"
+  - evidence: e6f00f83 · 2026-11-15 02:00 · exit 0 · "1"
 - [x] S11 Run the smoke test and record the result | kind: spike | req: - | est: 30m
   - check: `grep -c 'neither arm called an audio tool' docs/ROADMAP.md`
   - expect: `1`
