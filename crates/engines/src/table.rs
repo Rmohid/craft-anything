@@ -222,7 +222,9 @@ const GHIDRA_ROOTS: &[KnownRoot] = &[
     root("linux", Base::Env("HOME"), "Desktop", 1),
 ];
 
-/// Browsers on Windows and macOS rarely put themselves on PATH.
+/// Browsers on Windows and macOS rarely put themselves on PATH. Ego lite (a Chromium fork)
+/// lives there too; its `ego-browser` helper is a Node bridge, not the browser, so it is kept
+/// out of `exes` and only the app's executable appears here.
 const CHROMIUM_PATHS: &[KnownPath] = &[
     win("ProgramFiles", "Google/Chrome/Application/chrome.exe"),
     win("ProgramFiles(x86)", "Google/Chrome/Application/chrome.exe"),
@@ -244,6 +246,8 @@ const CHROMIUM_PATHS: &[KnownPath] = &[
     mac(Base::Env("HOME"), "Applications/Chromium.app/Contents/MacOS/Chromium"),
     mac(Base::Dir("/Applications"), "Brave Browser.app/Contents/MacOS/Brave Browser"),
     mac(Base::Env("HOME"), "Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
+    mac(Base::Dir("/Applications"), "ego lite.app/Contents/MacOS/ego lite"),
+    mac(Base::Env("HOME"), "Applications/ego lite.app/Contents/MacOS/ego lite"),
     // Flatpak puts only a start script, named after the app, in its exports folder (#747).
     linux("/var/lib/flatpak/exports/bin", "com.google.Chrome"),
     linux("/var/lib/flatpak/exports/bin", "com.brave.Browser"),

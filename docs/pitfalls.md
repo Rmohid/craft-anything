@@ -1023,6 +1023,12 @@ backends from older versions or found from a key got a new id on every run. A fa
 run is a workaround, not a fix: give each saved provider backend its id once, at startup, before
 any session lock is held (`AiHub::ensure_session_id`), and test a restart keeps the same id.
 
+**A helper named after the app it serves.** `ego-browser` on PATH is ego lite's Node bridge
+(`profiles()`, `task.cdp`), not the browser; launching it with `--remote-debugging-port` starts
+nothing debuggable. The browser is `/Applications/ego lite.app/Contents/MacOS/ego lite`, found
+through the chromium entry's known paths, and the helper is never listed as an executable.
+Check what a similarly named binary actually is before treating it as the engine.
+
 ## Agent tooling
 
 **Shared CLI efforts reached Claude unchanged.** Keep CLI-only levels available for agents, but

@@ -113,6 +113,9 @@ pub const TOOLS: &[&str] = &[
     "web_site_close",
     // Checks a script's form; it touches no target and starts no browser.
     "web_walkthrough_check",
+    // Fingerprints and compares audio captures already in hand; no browser, no target.
+    "web_audio_fingerprint",
+    "web_audio_compare",
     // A program watched from outside: its window, the controls on its screen, a recorded run.
     "native_window_capture",
     "runtime_ui_read",
@@ -172,6 +175,14 @@ mod tests {
         for id in TOOLS {
             assert!(r.get(id).is_some() || higher_layers.iter().any(|p| id.starts_with(p)), "{id} isn't a tool");
             assert_eq!(TOOLS.iter().filter(|t| *t == id).count(), 1, "{id} is listed twice");
+        }
+    }
+
+    #[test]
+    fn the_pure_audio_compare_tools_run_in_clean_room() {
+        for id in ["web_audio_fingerprint", "web_audio_compare"] {
+            assert!(allows(id), "{id} only computes over evidence already in hand");
+            assert!(availability(id, true).is_none(), "{id} must run in Clean room");
         }
     }
 

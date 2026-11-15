@@ -219,6 +219,20 @@ mod tests {
     }
 
     #[test]
+    fn attached_browser_fields_are_surfaced_from_the_schema() {
+        use craft_anything_engine::Registry;
+        let r = Registry::with_all_tools();
+        let spec = r.get("web_site_open").unwrap();
+        let schema = (spec.input_schema)();
+        let f = fields(&schema);
+        let browser = f.iter().find(|x| x.name == "browser").expect("browser field");
+        assert!(browser.description.contains("attached"), "{}", browser.description);
+        let cdp = f.iter().find(|x| x.name == "cdp_endpoint").expect("cdp_endpoint field");
+        assert!(cdp.description.to_ascii_lowercase().contains("loopback") && cdp.description.contains("remote-debugging-port"), "{}", cdp.description);
+        assert!(!browser.required && !cdp.required, "private stays the default");
+    }
+
+    #[test]
     fn fields_and_values_follow_the_schema() {
         let f = fields(&schema());
         assert_eq!(f[0].name, "path");

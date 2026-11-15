@@ -10,8 +10,9 @@
 use super::native_common::spec;
 use super::web_common::{self, Browser, LaunchOptions, Secrets};
 use crate::tool::{Ctx, Effects, Requires, ToolOutput, ToolSpec, Toolset, parse_params, schema_of};
+use craft_anything_analysis::audio::{self, Edge, EnvelopeSample, Fingerprint, GraphSignature};
 use craft_anything_engines::cdp::{self, CdpClient, Deadline, PAGE_MAX_MESSAGE};
-use craft_anything_evidence::{Authority, Confidence, Coverage, CoverageStatus, EvidenceBuilder, Limitation, Location, Subject, ToolError};
+use craft_anything_evidence::{Authority, Confidence, Coverage, CoverageStatus, ErrorCode, EvidenceBuilder, Limitation, Location, Subject, ToolError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -139,6 +140,50 @@ pub fn specs() -> Vec<ToolSpec> {
             Requires::Nothing,
             schema_of::<script_check::WalkthroughCheckParams>,
             script_check::web_walkthrough_check,
+        ),
+        spec(
+            "web_audio_fingerprint",
+            "Fingerprint an audio scene",
+            "Turn a web_audio_capture result (the evidence record, its id, or its raw {graph, spectrum, rms, mixer_state, mixer_envelope} object) — or an inline spectrum and RMS envelope — into a versioned audio fingerprint: 48 log-spaced spectrum bins, a 1 Hz loudness envelope, the audio-graph signature and the page's mixer state. Pure computation over evidence already in hand; no browser.",
+            "Record what a web page's audio sounds like, so two captures can be compared.",
+            Toolset::Browser,
+            Effects::EVIDENCE,
+            Requires::Nothing,
+            schema_of::<FingerprintAudioParams>,
+            web_audio_fingerprint,
+        ),
+        spec(
+            "web_audio_compare",
+            "Compare two audio fingerprints",
+            "Compare two audio fingerprints (from web_audio_fingerprint or web_audio_offline_render): log-bin cosine, RMS-envelope correlation, graph differences, mixer-envelope distance, and whether the two scenes are alike (spectral cosine, RMS correlation and, when both sides have one, the traced mixer trajectory within their tolerances; 0.85, 0.80 and 0.85 by default). Pure computation; no browser.",
+            "Measure whether a rebuilt audio scene sounds like the original.",
+            Toolset::Browser,
+            Effects::EVIDENCE,
+            Requires::Nothing,
+            schema_of::<CompareAudioParams>,
+            web_audio_compare,
+        ),
+        spec(
+            "web_audio_capture",
+            "Capture a page's live audio",
+            "Listen to a page's live Web Audio graph over CDP for 5 to 120 seconds: node kinds and connections, an AnalyserNode's averaged frequency spectrum, a 1 Hz loudness envelope, the page's mixer state (scenario id, layer gains and pans), and an outline of the requests the page made while listening. Set `interaction_trace` with scripted `steps` to follow the mix's movement: each layer's gain and pan is polled at 10 Hz into `mixer_envelope` (at most 6000 readings over 60 seconds). Injects an introspection script, so it needs your approval and Deep mode; cookies, storage values and declared secrets are redacted, and no audio is recorded.",
+            "Measure what a web page is playing right now, so a rebuild can be compared against it.",
+            Toolset::Browser,
+            Effects::EVIDENCE.union(Effects::EXECUTES_FOREIGN_CODE).union(Effects::ACCESSES_NETWORK).union(Effects::LAUNCHES_PROCESS),
+            Requires::Nothing,
+            schema_of::<CaptureAudioParams>,
+            web_audio_capture,
+        ),
+        spec(
+            "web_audio_offline_render",
+            "Render an audio recipe offline",
+            "Rebuild an audio scene from a versioned recipe (oscillator layers with an optional filter, gain and pan, and an optional gain/pan envelope scheduled with setValueCurveAtTime; at most 256 layers) in a headless OfflineAudioContext, then fingerprint what it rendered: 48 log-spaced spectrum bins, a 1 Hz loudness envelope, the recipe's graph signature and its scheduled mixer trajectory, plus the rendered length. Launches or attaches to a Chromium over CDP and injects the recipe, so it needs your approval and Deep mode. The fingerprint goes straight into web_audio_compare as the rebuilt side.",
+            "Rebuild a sound recipe in a private headless browser and measure how close it comes to the original.",
+            Toolset::Browser,
+            Effects::EVIDENCE.union(Effects::EXECUTES_FOREIGN_CODE).union(Effects::ACCESSES_NETWORK).union(Effects::LAUNCHES_PROCESS),
+            Requires::Nothing,
+            schema_of::<OfflineRenderParams>,
+            web_audio_offline_render,
         ),
     ]
 }
@@ -1673,6 +1718,2091 @@ fn load_png(ctx: &Ctx<'_>, v: &Value, what: &str) -> Result<Vec<u8>, ToolError> 
 }
 
 // ---------------------------------------------------------------------------------------------
+// web_audio_fingerprint / web_audio_compare (pure computation)
+
+/// One interaction-traced mixer reading, as a capture or a caller records it.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MixerSample {
+    /// Milliseconds since the trace started.
+    pub t_ms: u64,
+    /// The mixer layer this reading belongs to.
+    pub layer_id: String,
+    /// Layer gain at the reading.
+    pub gain: f32,
+    /// Stereo pan at the reading.
+    pub pan: f32,
+}
+
+impl From<MixerSample> for EnvelopeSample {
+    fn from(sample: MixerSample) -> Self {
+        EnvelopeSample { t_ms: sample.t_ms, layer_id: sample.layer_id, gain: sample.gain, pan: sample.pan }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FingerprintAudioParams {
+    /// A capture from web_audio_capture: the evidence record, {"kind":"saved","evidence_id":…}, its
+    /// id, or the raw result object {graph, spectrum, rms, mixer_state, mixer_envelope}.
+    #[serde(default)]
+    pub capture: Option<Value>,
+    /// Raw spectrum values to quantise into 48 log-spaced bins (inline alternative to `capture`).
+    #[serde(default)]
+    pub spectrum: Option<Vec<f32>>,
+    /// One RMS value per second of capture.
+    #[serde(default)]
+    pub rms: Option<Vec<f32>>,
+    /// The audio graph signature: {"node_counts": {"gain": 2}, "edges": [{"from": …, "to": …, "kind": "audio"}]}.
+    #[serde(default)]
+    pub graph: Option<Value>,
+    /// The page's mixer state object, e.g. {"scenario_id": "focus"}.
+    #[serde(default)]
+    pub mixer_state: Option<Value>,
+    /// Interaction-traced readings: [{"t_ms": 0, "layer_id": "pad", "gain": 0.4, "pan": 0.0}].
+    #[serde(default)]
+    pub mixer_envelope: Option<Vec<MixerSample>>,
+    /// When the capture happened, in Unix milliseconds.
+    #[serde(default)]
+    pub captured_at_ms: Option<u64>,
+}
+
+fn web_audio_fingerprint(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
+    let p: FingerprintAudioParams = parse_params(params)?;
+    let has_input =
+        p.capture.is_some() || p.spectrum.is_some() || p.rms.is_some() || p.graph.is_some() || p.mixer_state.is_some() || p.mixer_envelope.is_some();
+    if !has_input {
+        return Err(ToolError::invalid("there is no audio capture to fingerprint")
+            .with_remediation("Pass `capture` from web_audio_capture, or inline `spectrum`/`rms`/`graph`/`mixer_state`."));
+    }
+
+    let mut spectrum = p.spectrum.unwrap_or_default();
+    let mut rms = p.rms.unwrap_or_default();
+    let mut graph = p.graph.unwrap_or(Value::Null);
+    let mut mixer = p.mixer_state.unwrap_or(Value::Null);
+    let mut envelope: Option<Vec<EnvelopeSample>> = p.mixer_envelope.map(|samples| samples.into_iter().map(EnvelopeSample::from).collect());
+    let mut captured_at_ms = p.captured_at_ms.unwrap_or(0);
+    let mut deep_mode = false;
+    let mut capture_id: Option<String> = None;
+    let mut source = "inline";
+    if let Some(value) = &p.capture {
+        let (id, result, deep) = resolve_audio_capture(ctx, value)?;
+        source = if id.is_some() { "a capture's evidence" } else { "a capture object" };
+        deep_mode = deep;
+        capture_id = id;
+        if spectrum.is_empty() {
+            spectrum = number_list(&result, "spectrum")?;
+        }
+        if rms.is_empty() {
+            rms = number_list(&result, "rms")?;
+        }
+        if graph.is_null() {
+            graph = result.get("graph").cloned().unwrap_or(Value::Null);
+        }
+        if mixer.is_null() {
+            mixer = result.get("mixer_state").cloned().unwrap_or(Value::Null);
+        }
+        if envelope.is_none() {
+            envelope = Some(mixer_samples(result.get("mixer_envelope"), "the capture's mixer_envelope")?);
+        }
+        if captured_at_ms == 0 {
+            captured_at_ms = result.get("captured_at_ms").and_then(Value::as_u64).unwrap_or(0);
+        }
+    }
+    let envelope = envelope.unwrap_or_default();
+
+    let mut fingerprint = audio::fingerprint_from_capture(&spectrum, &rms, graph, mixer, &envelope)?;
+    fingerprint.deep_mode = deep_mode;
+    fingerprint.captured_at_ms = captured_at_ms;
+    let scenario = if fingerprint.scenario_id.is_empty() { "an audio scene".to_string() } else { fingerprint.scenario_id.clone() };
+    let summary = format!(
+        "Fingerprinted {scenario} from {source}: {} log bin(s), {} RMS value(s), {} graph node kind(s), {} mixer sample(s).",
+        fingerprint.log_bins.len(),
+        fingerprint.rms_envelope.len(),
+        fingerprint.graph_signature.node_counts.len(),
+        fingerprint.mixer_envelope.len()
+    );
+    let params = json!({
+        "source": source,
+        "capture_evidence_id": capture_id,
+        "spectrum_values": spectrum.len(),
+        "rms_values": fingerprint.rms_envelope.len(),
+        "deep_mode": deep_mode,
+        "captured_at_ms": captured_at_ms,
+    });
+    let mut builder = EvidenceBuilder::new(
+        "web_audio_fingerprint",
+        Subject { kind: "audio-scene".into(), sha256: None, name: Some(scenario) },
+        super::artifact_tools::env(ctx),
+    )
+    .params(params)
+    .result(json!({"fingerprint": fingerprint}))
+    .summary(summary)
+    .confidence(Confidence::Derived)
+    .limitation(Limitation::new("summary_not_a_recording", "A fingerprint is a summary, not a recording: it keeps no audio samples."))
+    .coverage(Coverage::complete(1));
+    if let Some(id) = capture_id {
+        builder = builder.link(id);
+    }
+    Ok(ToolOutput::evidence(builder.build()?))
+}
+
+/// The raw capture object behind `capture` (the evidence record's result, or the object itself), the
+/// evidence id when there was one, and whether the capture ran in Deep mode.
+fn resolve_audio_capture(ctx: &Ctx<'_>, value: &Value) -> Result<(Option<String>, Value, bool), ToolError> {
+    let looks_like_evidence =
+        value.is_string() || value.get("kind").and_then(Value::as_str) == Some("saved") || (value.get("operation").is_some() && value.get("result").is_some());
+    if !looks_like_evidence {
+        if !value.is_object() {
+            return Err(ToolError::invalid("`capture` isn't a capture object")
+                .with_remediation("Pass the evidence web_audio_capture returned, or its {graph, spectrum, rms, mixer_state} object."));
+        }
+        return Ok((None, value.clone(), false));
+    }
+    let ev = super::artifact_tools::resolve_evidence_input(ctx, value, &["web_audio_capture"])?;
+    let deep = !ev.environment.clean_room;
+    Ok((Some(ev.id), ev.result, deep))
+}
+
+/// A list of numbers from a capture object; a missing or null key is an empty list.
+fn number_list(capture: &Value, key: &str) -> Result<Vec<f32>, ToolError> {
+    match capture.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
+            ToolError::invalid(format!("the capture's `{key}` isn't a list of numbers: {error}"))
+                .with_remediation("Pass the numbers web_audio_capture returned for `spectrum` and `rms`.")
+        }),
+    }
+}
+
+/// Interaction-traced mixer readings from a capture object or a bare list.
+fn mixer_samples(value: Option<&Value>, what: &str) -> Result<Vec<EnvelopeSample>, ToolError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else { return Ok(Vec::new()) };
+    let rows: Vec<MixerSample> = serde_json::from_value(value.clone()).map_err(|error| {
+        ToolError::invalid(format!("{what} isn't a list of mixer readings: {error}"))
+            .with_remediation("Pass [{t_ms, layer_id, gain, pan}] samples, or omit the envelope.")
+    })?;
+    Ok(rows.into_iter().map(EnvelopeSample::from).collect())
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CompareAudioParams {
+    /// The earlier fingerprint: web_audio_fingerprint evidence, a web_audio_offline_render result,
+    /// {"kind":"saved","evidence_id":…}, or a bare fingerprint object.
+    pub before: Value,
+    /// The later fingerprint, in the same forms.
+    pub after: Value,
+    /// How far the log-bin cosine may fall short of 1.0 and still count as alike (0..=1, default 0.15).
+    #[serde(default = "d_log_bin_tolerance")]
+    pub log_bin_tolerance: f64,
+    /// How far the RMS-envelope cosine may fall short of 1.0 and still count as alike (0..=1, default 0.20).
+    #[serde(default = "d_rms_tolerance")]
+    pub rms_tolerance: f64,
+    /// How far apart two interaction-traced mixer envelopes may be and still count as alike
+    /// (0..=1, mean per-sample gain+pan distance; default 0.15).
+    #[serde(default = "d_envelope_tolerance")]
+    pub envelope_tolerance: f64,
+}
+
+fn d_log_bin_tolerance() -> f64 {
+    0.15
+}
+
+fn d_rms_tolerance() -> f64 {
+    0.20
+}
+
+fn d_envelope_tolerance() -> f64 {
+    0.15
+}
+
+fn web_audio_compare(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
+    let p: CompareAudioParams = parse_params(params)?;
+    for (name, value) in [("log_bin_tolerance", p.log_bin_tolerance), ("rms_tolerance", p.rms_tolerance), ("envelope_tolerance", p.envelope_tolerance)] {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(ToolError::invalid(format!("{name} must be 0..=1"))
+                .with_remediation("Use 0.15 for the spectrum and the envelope, and 0.20 for RMS, unless you need a looser or tighter match."));
+        }
+    }
+    let (before, before_id) = parse_fingerprint_input(ctx, &p.before, "before")?;
+    let (after, after_id) = parse_fingerprint_input(ctx, &p.after, "after")?;
+
+    let log_bin_cosine = audio::spectral_cosine(&before.log_bins, &after.log_bins)?;
+    let rms_correlation = rms_correlation(&before.rms_envelope, &after.rms_envelope);
+    let envelope_distance = audio::envelope_distance(&before.mixer_envelope, &after.mixer_envelope);
+    let graph_diff = graph_diff(&before.graph_signature, &after.graph_signature);
+    // A traced trajectory only constrains the verdict when both sides have one: a capture without a
+    // trace says nothing about the mix, and comparing it against a trace would call a real match a
+    // difference (an absent layer reads as silence).
+    let envelope_compared = !before.mixer_envelope.is_empty() && !after.mixer_envelope.is_empty();
+    let envelope_alike = !envelope_compared || envelope_distance <= p.envelope_tolerance;
+    let likeness_pass = log_bin_cosine >= 1.0 - p.log_bin_tolerance && rms_correlation >= 1.0 - p.rms_tolerance && envelope_alike;
+    let low_energy = !has_energy(&before.log_bins) || !has_energy(&after.log_bins) || !has_energy(&before.rms_envelope) || !has_energy(&after.rms_envelope);
+    let graphs_differ = graph_diff["same"] != true;
+    let summary = format!(
+        "The two audio fingerprints {}: log-bin cosine {log_bin_cosine:.3}, RMS correlation {rms_correlation:.3}, mixer-envelope distance {envelope_distance:.3}{}{}.",
+        if likeness_pass { "are alike" } else { "differ" },
+        if envelope_compared && !envelope_alike { "; their traced mix moves differently" } else { "" },
+        if graphs_differ { "; their audio graphs differ" } else { "" }
+    );
+    let mut builder = EvidenceBuilder::new(
+        "web_audio_compare",
+        Subject { kind: "comparison".into(), sha256: None, name: Some("audio fingerprints".into()) },
+        super::artifact_tools::env(ctx),
+    )
+    .params(json!({
+        "before": before_id,
+        "after": after_id,
+        "log_bin_tolerance": p.log_bin_tolerance,
+        "rms_tolerance": p.rms_tolerance,
+        "envelope_tolerance": p.envelope_tolerance,
+    }))
+    .result(json!({
+        "log_bin_cosine": log_bin_cosine,
+        "rms_correlation": rms_correlation,
+        "graph_diff": graph_diff,
+        "envelope_distance": envelope_distance,
+        "envelope_compared": envelope_compared,
+        "likeness_pass": likeness_pass,
+    }))
+    .summary(summary)
+    .confidence(Confidence::Derived)
+    .limitation(Limitation::new(
+        "spectral_summary_only",
+        "The verdict compares spectral shape and loudness: it cannot hear timbre, stereo image or content beyond the 1 Hz envelope.",
+    ))
+    .coverage(Coverage::complete(1));
+    if low_energy {
+        builder = builder.limitation(Limitation::new(
+            "low_energy",
+            "At least one side has no spectral or loudness energy (silence, or an analyser that returned zeros); the verdict cannot pass.",
+        ));
+    }
+    if before.rms_envelope.len() != after.rms_envelope.len() {
+        builder = builder.limitation(Limitation::new(
+            "rms_resampled",
+            format!(
+                "The two RMS envelopes have different lengths ({} and {} values) and were proportionally resampled before their correlation was measured.",
+                before.rms_envelope.len(),
+                after.rms_envelope.len()
+            ),
+        ));
+    }
+    if before.mixer_envelope.len() != after.mixer_envelope.len() && !before.mixer_envelope.is_empty() && !after.mixer_envelope.is_empty() {
+        builder = builder.limitation(Limitation::new(
+            "envelope_resampled",
+            "The two mixer envelopes have different lengths and were proportionally resampled before their distance was measured.",
+        ));
+    }
+    if !envelope_compared && (!before.mixer_envelope.is_empty() || !after.mixer_envelope.is_empty()) {
+        builder = builder.limitation(Limitation::new(
+            "envelope_not_compared",
+            "Only one side has an interaction-traced mixer envelope, so the trajectory did not constrain the verdict.",
+        ));
+    }
+    if let Some(id) = before_id {
+        builder = builder.link(id);
+    }
+    if let Some(id) = after_id {
+        builder = builder.link(id);
+    }
+    Ok(ToolOutput::evidence(builder.build()?))
+}
+
+/// A fingerprint from a tool result ({fingerprint: {…}} or a bare fingerprint), migrated to a
+/// supported version, with the evidence id it came from when it was an evidence record.
+fn parse_fingerprint_input(ctx: &Ctx<'_>, value: &Value, what: &str) -> Result<(Fingerprint, Option<String>), ToolError> {
+    let looks_like_evidence =
+        value.is_string() || value.get("kind").and_then(Value::as_str) == Some("saved") || (value.get("operation").is_some() && value.get("result").is_some());
+    let (fingerprint, id) = if looks_like_evidence {
+        let ev = super::artifact_tools::resolve_evidence_input(ctx, value, &["web_audio_fingerprint", "web_audio_offline_render"])?;
+        let fingerprint = fingerprint_object(&ev.result).ok_or_else(|| {
+            ToolError::invalid(format!("{what} evidence {} carries no audio fingerprint", ev.id))
+                .with_remediation("Pass the result of web_audio_fingerprint or web_audio_offline_render.")
+        })?;
+        (fingerprint, Some(ev.id))
+    } else {
+        (value.get("fingerprint").cloned().unwrap_or_else(|| value.clone()), None)
+    };
+    let fingerprint: Fingerprint = serde_json::from_value(fingerprint).map_err(|error| {
+        ToolError::invalid(format!("{what} isn't an audio fingerprint: {error}"))
+            .with_remediation("Pass the evidence a fingerprint tool returned, or its `fingerprint` object.")
+    })?;
+    Ok((audio::migrate(fingerprint)?, id))
+}
+
+/// The fingerprint object inside a result: `{fingerprint: {…}}`, or the result itself when it already
+/// is a fingerprint (a bare object or an offline render's `{fingerprint, rendered_ms}`).
+fn fingerprint_object(result: &Value) -> Option<Value> {
+    result.get("fingerprint").filter(|value| value.is_object()).cloned().or_else(|| result.is_object().then(|| result.clone()))
+}
+
+/// True when any value is finite and non-zero.
+fn has_energy(values: &[f32]) -> bool {
+    values.iter().any(|value| value.is_finite() && *value != 0.0)
+}
+
+/// Cosine similarity of two RMS envelopes, in `-1..=1`.
+///
+/// Scale-invariant, so a louder recording of the same shape still matches; a mirrored shape
+/// (0→1 against 1→0) scores low. Envelopes of different lengths are linearly resampled to the
+/// longer one first (98 vs 100 readings compares, never panics). Zero energy on either side
+/// scores `0.0` rather than a NaN.
+fn rms_correlation(a: &[f32], b: &[f32]) -> f64 {
+    let len = a.len().max(b.len());
+    if len == 0 {
+        return 0.0;
+    }
+    let left = resample_envelope(a, len);
+    let right = resample_envelope(b, len);
+    let mut dot = 0.0f64;
+    let mut left_norm = 0.0f64;
+    let mut right_norm = 0.0f64;
+    for (left, right) in left.iter().zip(right.iter()) {
+        let left = if left.is_finite() { f64::from(*left) } else { 0.0 };
+        let right = if right.is_finite() { f64::from(*right) } else { 0.0 };
+        dot += left * right;
+        left_norm += left * left;
+        right_norm += right * right;
+    }
+    if left_norm == 0.0 || right_norm == 0.0 {
+        return 0.0;
+    }
+    let cosine = dot / (left_norm.sqrt() * right_norm.sqrt());
+    if cosine.is_finite() { cosine.clamp(-1.0, 1.0) } else { 0.0 }
+}
+
+/// Linearly resample an envelope to `len` values; an empty envelope reads as silence.
+fn resample_envelope(points: &[f32], len: usize) -> Vec<f32> {
+    if len == 0 {
+        return Vec::new();
+    }
+    if points.is_empty() {
+        return vec![0.0; len];
+    }
+    if points.len() == len {
+        return points.to_vec();
+    }
+    let last = points.len().saturating_sub(1);
+    let mut out = Vec::with_capacity(len);
+    for index in 0..len {
+        let position = ((index as f64 + 0.5) * points.len() as f64 / len as f64 - 0.5).clamp(0.0, last as f64);
+        let lo = position.floor() as usize;
+        let hi = (lo + 1).min(last);
+        let weight = (position - lo as f64) as f32;
+        let low = points.get(lo).copied().unwrap_or(0.0);
+        let high = points.get(hi).copied().unwrap_or(0.0);
+        out.push(low + (high - low) * weight);
+    }
+    out
+}
+
+/// What changed between two audio graphs: node counts per kind, and connections.
+fn graph_diff(before: &GraphSignature, after: &GraphSignature) -> Value {
+    let mut kinds: std::collections::BTreeSet<&String> = before.node_counts.keys().collect();
+    kinds.extend(after.node_counts.keys());
+    let mut added_nodes = serde_json::Map::new();
+    let mut removed_nodes = serde_json::Map::new();
+    for kind in kinds {
+        let was = before.node_counts.get(kind).copied().unwrap_or(0);
+        let now = after.node_counts.get(kind).copied().unwrap_or(0);
+        if now > was {
+            added_nodes.insert(kind.clone(), json!(now - was));
+        }
+        if was > now {
+            removed_nodes.insert(kind.clone(), json!(was - now));
+        }
+    }
+    let before_edges: std::collections::BTreeSet<&Edge> = before.edges.iter().collect();
+    let after_edges: std::collections::BTreeSet<&Edge> = after.edges.iter().collect();
+    let added_edges: Vec<&Edge> = after_edges.difference(&before_edges).copied().collect();
+    let removed_edges: Vec<&Edge> = before_edges.difference(&after_edges).copied().collect();
+    let same = added_nodes.is_empty() && removed_nodes.is_empty() && added_edges.is_empty() && removed_edges.is_empty();
+    json!({
+        "same": same,
+        "added_nodes": added_nodes,
+        "removed_nodes": removed_nodes,
+        "added_edges": added_edges,
+        "removed_edges": removed_edges,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// web_audio_capture (Deep-only: live audio graph, spectrum and mixer state)
+
+/// Most spectrum values a capture keeps (a 32k-point FFT is 16k bins; 4k is plenty to bin).
+const MAX_CAPTURE_SPECTRUM: usize = 4_096;
+/// Most loudness values a capture keeps (ten minutes at one per second).
+const MAX_CAPTURE_RMS: usize = 600;
+/// Most graph edges a capture keeps.
+const MAX_CAPTURE_EDGES: usize = 2_000;
+/// Most node kinds a capture keeps.
+const MAX_CAPTURE_KINDS: usize = 64;
+/// Largest mixer-state object a capture keeps, in bytes.
+const MAX_MIXER_BYTES: usize = 256 * 1024;
+/// Most endpoints the network outline names.
+const MAX_OUTLINE_ENDPOINTS: usize = 50;
+/// Most scripted interaction steps a traced capture runs.
+const MAX_TRACE_STEPS: usize = 200;
+/// Most interaction-traced mixer readings a capture keeps.
+const MAX_TRACE_SAMPLES: usize = 6_000;
+/// Longest an interaction trace may run, in milliseconds.
+const MAX_TRACE_MS: u64 = 60_000;
+/// How often the page sampler reads each layer's gain and pan, in milliseconds (10 Hz).
+const TRACE_PERIOD_MS: u64 = 100;
+/// How long to let the 10 Hz poll see a step's effect before the next step.
+const TRACE_SETTLE_MS: u64 = 150;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureAudioParams {
+    /// Loopback CDP endpoint, e.g. http://127.0.0.1:9222. Omit to launch a browser.
+    #[serde(default)]
+    pub cdp_endpoint: Option<String>,
+    /// Launch a located Chromium when no endpoint is given.
+    #[serde(default)]
+    pub launch: bool,
+    /// Launch headless (when launching).
+    #[serde(default = "yes")]
+    pub headless: bool,
+    /// Pass --no-sandbox when launching (needed in some containers).
+    #[serde(default)]
+    pub no_sandbox: bool,
+    /// The page target to listen to (default: the first page).
+    #[serde(default)]
+    pub target_id: Option<String>,
+    /// How long to sample the live audio, in milliseconds (5000..=120000).
+    #[serde(default = "d_capture_duration_ms")]
+    pub duration_ms: u64,
+    /// Follow how the mix moves: after the snapshot, poll each layer's gain and pan at 10 Hz into
+    /// `mixer_envelope` while `steps` run (at most 6000 readings and 60 seconds).
+    #[serde(default)]
+    pub interaction_trace: bool,
+    /// The scripted steps to run while tracing (at most 200), in web_walkthrough_record's shape:
+    /// {kind: "click", selector: "#pad-slider"}, {kind: "wait", ms: 500}, …
+    #[serde(default)]
+    pub steps: Vec<WalkthroughStep>,
+    /// Overall limit for the whole capture, in seconds (1..=600).
+    #[serde(default = "d_capture_timeout")]
+    pub timeout_secs: u64,
+    /// Values to redact wherever they appear in the capture (cookies, tokens, names).
+    #[serde(default)]
+    pub hidden_values: Vec<String>,
+}
+
+fn d_capture_duration_ms() -> u64 {
+    30_000
+}
+
+fn d_capture_timeout() -> u64 {
+    180
+}
+
+fn web_audio_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
+    let p: CaptureAudioParams = parse_params(params)?;
+    if !(5_000..=120_000).contains(&p.duration_ms) {
+        return Err(ToolError::invalid(format!("duration_ms must be 5000..=120000; {} is outside that window", p.duration_ms))
+            .with_remediation("Listen for five seconds or longer (up to two minutes) so the spectrum and one-per-second loudness envelope mean something."));
+    }
+    if p.steps.len() > MAX_TRACE_STEPS {
+        return Err(ToolError::invalid(format!("steps must be at most {MAX_TRACE_STEPS}; {} were given", p.steps.len()))
+            .with_remediation("Trace fewer interaction steps, or record them as a separate web_walkthrough_record run."));
+    }
+    if !p.steps.is_empty() && !p.interaction_trace {
+        return Err(ToolError::invalid("steps were given without interaction_trace")
+            .with_remediation("Set `interaction_trace: true` to run the steps and record the mix, or omit `steps` to capture without them."));
+    }
+    let dl = deadline(ctx, p.timeout_secs)?;
+    let launch = p.launch || p.cdp_endpoint.is_none();
+    let browser = resolve_browser(ctx, p.cdp_endpoint.as_deref(), launch, p.headless, p.no_sandbox, &dl)?;
+    let targets = cdp::json_list(&browser.endpoint, &dl)?;
+    let target = web_common::pick_target(&targets, p.target_id.as_deref(), Some("page"))?;
+    let page_url = web_common::sanitize_url(target.get("url").and_then(Value::as_str).unwrap_or_default());
+    let mut client = web_common::connect_target(&browser, target, PAGE_MAX_MESSAGE, &dl)?;
+    let mut secrets = Secrets::new(&p.hidden_values);
+    // Runtime runs the introspection script, Media reports which audio is playing, and Network
+    // outlines the requests made while the capture listens.
+    let _ = client.call("Runtime.enable", json!({}), None, &dl);
+    let _ = client.call("Media.enable", json!({}), None, &dl);
+    let network_enabled = client.call("Network.enable", json!({}), None, &dl).is_ok();
+
+    let reply = match client.call(
+        "Runtime.evaluate",
+        json!({
+            "expression": audio_capture_script(p.duration_ms),
+            "awaitPromise": true,
+            "returnByValue": true,
+            "userGesture": true,
+        }),
+        None,
+        &dl,
+    ) {
+        Ok(reply) => reply,
+        Err(error) => return cleanup_then_err(&mut client, &dl, error),
+    };
+    if let Some(details) = reply.get("exceptionDetails") {
+        let text = details
+            .pointer("/exception/description")
+            .and_then(Value::as_str)
+            .or_else(|| details.get("text").and_then(Value::as_str))
+            .unwrap_or("the introspection script failed");
+        let error = ToolError::new(ErrorCode::ProgramFailed, format!("the page rejected the audio introspection: {}", clip_text(text, 400)))
+            .with_remediation("Reload the page and try again; a Content-Security-Policy that blocks injected scripts also blocks this capture.");
+        return cleanup_then_err(&mut client, &dl, error);
+    }
+    let capture = match parse_audio_capture_reply(&reply) {
+        Ok(capture) => capture,
+        Err(error) => return cleanup_then_err(&mut client, &dl, error),
+    };
+    // The snapshot above is static: with interaction_trace, follow the layers' gain and pan while
+    // the scripted steps move them, so the mix's trajectory becomes evidence too.
+    let trace = if p.interaction_trace { run_interaction_trace(&mut client, &p, &mut secrets, ctx, &dl) } else { TraceRun::untraced() };
+    let network_outline = audio_network_outline(&mut client, &mut secrets, network_enabled);
+    cleanup(&mut client, &dl);
+
+    let page_url = secrets.text(&page_url);
+    let scenario = capture.pointer("/mixer_state/scenario_id").and_then(Value::as_str).unwrap_or_default().to_string();
+    let name = secrets.text(&if scenario.is_empty() { page_url.clone() } else { scenario });
+    let node_kinds = capture.pointer("/graph/node_counts").and_then(Value::as_object).map(|counts| counts.len()).unwrap_or(0);
+    let node_count: u64 =
+        capture.pointer("/graph/node_counts").and_then(Value::as_object).map(|counts| counts.values().filter_map(Value::as_u64).sum()).unwrap_or(0);
+    let edge_count = capture.pointer("/graph/edges").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+    let spectrum_len = capture.get("spectrum").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+    let rms_len = capture.get("rms").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+    let graph_truncated = capture.get("graph_truncated").and_then(Value::as_bool).unwrap_or(false);
+    let spectrum_truncated = capture.get("spectrum_truncated").and_then(Value::as_bool).unwrap_or(false);
+    let sample_rate = capture.get("sample_rate").and_then(Value::as_u64).unwrap_or(48_000);
+    let fft_size = capture.get("fft_size").and_then(Value::as_u64).unwrap_or(0);
+    let samples = capture.get("samples").and_then(Value::as_u64).unwrap_or(0);
+    let trace_note =
+        if trace.started { format!(" Tracing recorded {} mixer reading(s) over {} ms.", trace.envelope.len(), trace.traced_ms) } else { String::new() };
+    let summary = secrets.text(&format!(
+        "Captured {} ms of {name}'s live audio: {node_count} node(s) across {node_kinds} kind(s), {edge_count} connection(s), {spectrum_len} spectrum bin(s) and {rms_len} loudness value(s) at {sample_rate} Hz.{trace_note}",
+        p.duration_ms
+    ));
+
+    let result = json!({
+        "browser": {"product": browser.product, "started_by": if browser.launched { "craft-anything" } else { "external" }, "cleanup": if browser.launched { "closed" } else { "disconnected" }},
+        "url": page_url,
+        "duration_ms": p.duration_ms,
+        "captured_at_ms": now_unix_ms(),
+        "graph": capture.get("graph").cloned().unwrap_or(Value::Null),
+        "graph_truncated": graph_truncated,
+        "spectrum": capture.get("spectrum").cloned().unwrap_or_else(|| json!([])),
+        "spectrum_truncated": spectrum_truncated,
+        "rms": capture.get("rms").cloned().unwrap_or_else(|| json!([])),
+        "mixer_state": capture.get("mixer_state").cloned().unwrap_or_else(|| json!({})),
+        "mixer_source": capture.get("mixer_source").cloned().unwrap_or_else(|| json!("none")),
+        "mixer_envelope": trace.envelope,
+        "interaction_trace": {
+            "enabled": p.interaction_trace,
+            "step_count": p.steps.len(),
+            "samples": trace.envelope.len(),
+            "traced_ms": trace.traced_ms,
+            "truncated": trace.truncated,
+            "aborted": trace.aborted,
+            "dropped": trace.dropped,
+            "defaulted_params": {"gain": trace.defaulted_gain, "pan": trace.defaulted_pan},
+        },
+        "network_outline": network_outline,
+        "sample_rate": sample_rate,
+        "fft_size": fft_size,
+        "samples": samples,
+        "secrets_hidden": p.hidden_values.len(),
+        "secret_redactions": 0,
+    });
+    let result = secrets.scrub(&result);
+    // Stamp the count after the scrub: scrubbing the page's graph and mixer state redacts values
+    // too, so a count taken while building the object would under-report.
+    let mut result = result;
+    if let Some(object) = result.as_object_mut() {
+        object.insert("secret_redactions".into(), json!(secrets.redactions));
+    }
+
+    let mut builder = EvidenceBuilder::new(
+        "web_audio_capture",
+        Subject { kind: "audio-scene".into(), sha256: None, name: Some(name) },
+        browser_env(ctx.session.clean_room(), &browser),
+    )
+    .params(json!({
+        "endpoint": browser.endpoint.origin,
+        "launched": browser.launched,
+        "duration_ms": p.duration_ms,
+        "target_id": p.target_id,
+        "sensitive_value_declarations": p.hidden_values.len(),
+    }))
+    .result(result)
+    .summary(summary)
+    .confidence(Confidence::Observed)
+    .authority(Authority::OurRun)
+    .limitation(Limitation::new(
+        "analyser_snapshot",
+        "The spectrum is one AnalyserNode's averaged FFT and its loudness one value per second, not a recording: layers, timbre beyond the bin resolution and everything shorter than a second are lost.",
+    ))
+    .limitation(Limitation::new(
+        "live_stochastic_scene",
+        "This is one live window of a page's audio: a second capture of a generative scene sounds different, so compare fingerprints rather than exact samples.",
+    ))
+    .coverage(Coverage::complete(1))
+    .location(Location::new("url", page_url));
+    if p.interaction_trace {
+        if trace.started {
+            builder = builder.limitation(Limitation::new(
+                "envelope_after_snapshot",
+                "The spectrum and loudness were measured before the interaction steps; mixer_envelope records where the steps moved each layer's gain and pan afterwards.",
+            ));
+        } else {
+            builder = builder.limitation(Limitation::new(
+                "trace_unavailable",
+                "The page's audio graph was not observable when the trace started, so no mixer envelope was recorded.",
+            ));
+        }
+        if trace.truncated {
+            builder = builder.limitation(Limitation::new(
+                "envelope_truncated",
+                "The trace hit its cap (6000 readings or 60 seconds) or lost unreadable rows; the envelope is not complete.",
+            ));
+        }
+        if trace.dropped > 0 {
+            builder = builder.limitation(Limitation::new(
+                "envelope_rows_dropped",
+                format!("{} of the page's mixer reading(s) were unreadable and were dropped; the envelope covers the rest.", trace.dropped),
+            ));
+        }
+        if trace.unreadable {
+            builder = builder
+                .limitation(Limitation::new("trace_unreadable", "The page's trace report carried no readable sample list, so no mixer envelope was recorded."));
+        }
+        if trace.defaulted_gain > 0 || trace.defaulted_pan > 0 {
+            builder = builder.limitation(Limitation::new(
+                "envelope_defaulted_params",
+                format!(
+                    "For {} layer(s) the page exposed no gain and for {} no pan; a missing gain is recorded as unity and a missing pan as centre, not as a measurement.",
+                    trace.defaulted_gain, trace.defaulted_pan
+                ),
+            ));
+        }
+        if let Some(aborted) = &trace.aborted {
+            builder = builder.limitation(Limitation::new(
+                "trace_aborted",
+                format!("The interaction trace stopped early ({aborted}); the envelope covers only the steps that ran."),
+            ));
+        }
+        if !p.steps.is_empty() {
+            builder = builder.limitation(Limitation::new(
+                "scripted_interaction",
+                "The mix was moved by scripted steps, so the envelope shows one interaction path, not every switch the page offers.",
+            ));
+        }
+        builder = builder.limitation(Limitation::new(
+            "layer_ids_from_page",
+            "Layers are named by the page's `__layerId` when it sets one, or by discovery order otherwise; declare `__layerId` so a rebuild can line the trajectories up.",
+        ));
+    } else {
+        builder = builder.limitation(Limitation::new(
+            "no_interaction_trace",
+            "This capture did not trace interactions, so mixer_envelope is empty and only the mixer state at the end is recorded.",
+        ));
+    }
+    if node_count == 0 {
+        builder = builder.limitation(Limitation::new(
+            "graph_not_observed",
+            "No audio node was created or connected after the script started, so the graph is empty: nodes the page built before the capture cannot be recovered.",
+        ));
+    }
+    if graph_truncated || spectrum_truncated {
+        builder =
+            builder.limitation(Limitation::new("bounded_capture", "Some graph edges, node kinds or spectrum bins were dropped to keep the capture bounded."));
+    }
+    if samples == 0 {
+        builder = builder.limitation(Limitation::new(
+            "no_audio_samples",
+            "The analyser returned no samples during the window: the audio context may be suspended, or the page plays nothing.",
+        ));
+    }
+    if p.hidden_values.iter().any(|value| !value.is_empty()) {
+        builder = builder.limitation(Limitation::new("secrets_redacted", format!("{} occurrence(s) of declared values were redacted", secrets.redactions)));
+    }
+    Ok(ToolOutput::evidence(builder.build()?))
+}
+
+/// The page script, with the requested window substituted. It resolves an existing AudioContext
+/// (null when the page has none), instruments node creation and connection, finds an analyser,
+/// then averages its spectrum and one-per-second loudness over the window. Bounded throughout.
+const AUDIO_CAPTURE_SCRIPT: &str = r#"
+(async () => {
+  const MAX_SPECTRUM = 4096, MAX_EDGES = 2000, MAX_NODES = 2000, MAX_LAYERS = 64, MAX_KINDS = 64, MAX_RMS = 600;
+  const DURATION_MS = __DURATION_MS__;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return null;
+  const kindOf = (node) => {
+    try {
+      const name = node && node.constructor && node.constructor.name;
+      if (typeof name !== 'string' || name.length === 0 || name.length > 64) return 'AudioNode';
+      return name.replace(/Node$/, '').replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+    } catch (error) { return 'AudioNode'; }
+  };
+  const findContext = () => {
+    const registry = window.__craftAnythingAudioContexts;
+    if (Array.isArray(registry)) {
+      for (const candidate of registry) {
+        if (candidate && typeof candidate.createAnalyser === 'function') return candidate;
+      }
+    }
+    for (const key of ['__craftAnythingAudioContext', 'audioContext', 'ctx']) {
+      let candidate;
+      try { candidate = window[key]; } catch (error) { continue; }
+      if (candidate && typeof candidate.createAnalyser === 'function' && candidate.destination) return candidate;
+    }
+    let seen = 0;
+    for (const key of Object.getOwnPropertyNames(window)) {
+      if (seen >= 5000) break;
+      seen += 1;
+      if (key.length > 128) continue;
+      let candidate;
+      try { candidate = window[key]; } catch (error) { continue; }
+      if (candidate && typeof candidate === 'object' && typeof candidate.createAnalyser === 'function' && typeof candidate.currentTime === 'number') return candidate;
+    }
+    return null;
+  };
+  const context = findContext();
+  if (!context) return null;
+  if (context.state === 'suspended') {
+    try { await context.resume(); } catch (error) {}
+  }
+  const tracker = (() => {
+    const prior = window.__craftAnythingAudioGraph;
+    const state = prior && prior.nodes instanceof Set && Array.isArray(prior.edges) ? prior : { nodes: new Set(), edges: [], truncated: false };
+    state.kindOf = kindOf;
+    // Node identity links (which node feeds which), so the interaction sampler can treat a
+    // gain and its panner as one mixer layer instead of inventing two.
+    if (!Array.isArray(state.links)) state.links = [];
+    const record = (node) => {
+      try {
+        if (node) {
+          if (state.nodes.size < MAX_NODES) state.nodes.add(node);
+          else state.truncated = true;
+        }
+      } catch (error) {}
+      return node;
+    };
+    const creators = ['createGain', 'createOscillator', 'createAnalyser', 'createBiquadFilter', 'createDelay', 'createConvolver', 'createDynamicsCompressor', 'createPanner', 'createStereoPanner', 'createWaveShaper', 'createChannelSplitter', 'createChannelMerger', 'createConstantSource', 'createBufferSource', 'createMediaElementSource', 'createMediaStreamSource', 'createScriptProcessor', 'createPeriodicWave'];
+    for (const name of creators) {
+      try {
+        const original = AC.prototype[name];
+        if (typeof original !== 'function' || original.__craftWrapped) continue;
+        const wrapped = function (...args) { return record(original.apply(this, args)); };
+        wrapped.__craftWrapped = true;
+        AC.prototype[name] = wrapped;
+      } catch (error) {}
+    }
+    try {
+      const prototype = window.AudioNode && window.AudioNode.prototype;
+      const original = prototype && prototype.connect;
+      if (typeof original === 'function' && !original.__craftWrapped) {
+        const wrapped = function (destination, ...rest) {
+          try {
+            const isParam = typeof window.AudioParam === 'function' && destination instanceof window.AudioParam;
+            if (state.edges.length < MAX_EDGES) {
+              state.edges.push({ from: kindOf(this), to: isParam ? 'AudioParam' : kindOf(destination), kind: isParam ? 'param' : 'audio' });
+            } else {
+              state.truncated = true;
+            }
+            if (!isParam && destination) {
+              if (state.links.length < MAX_EDGES) state.links.push([this, destination]);
+              else state.truncated = true;
+            }
+            record(this);
+            if (!isParam) record(destination);
+          } catch (error) {}
+          return original.call(this, destination, ...rest);
+        };
+        wrapped.__craftWrapped = true;
+        prototype.connect = wrapped;
+      }
+    } catch (error) {}
+    try { Object.defineProperty(window, '__craftAnythingAudioGraph', { value: state, configurable: true }); } catch (error) {}
+    return state;
+  })();
+  const snapshot = () => {
+    const counts = {};
+    const edges = [];
+    const seen = new Set();
+    let truncated = !!tracker.truncated;
+    for (const node of tracker.nodes) {
+      const kind = kindOf(node);
+      counts[kind] = (counts[kind] || 0) + 1;
+      if (Object.keys(counts).length > MAX_KINDS) truncated = true;
+    }
+    for (const edge of tracker.edges.slice(0, MAX_EDGES)) {
+      const key = edge.from + '\u0000' + edge.to + '\u0000' + edge.kind;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({ from: edge.from.slice(0, 64), to: edge.to.slice(0, 64), kind: edge.kind.slice(0, 32) });
+    }
+    return { graph: { node_counts: counts, edges: edges }, truncated: truncated };
+  };
+  const findAnalyser = () => {
+    const named = window.__craftAnythingAudioAnalyser;
+    if (named && typeof named.getByteFrequencyData === 'function') return named;
+    const registry = window.__craftAnythingAudioAnalysers;
+    if (Array.isArray(registry)) {
+      for (const candidate of registry) {
+        if (candidate && typeof candidate.getByteFrequencyData === 'function') return candidate;
+      }
+    }
+    for (const node of tracker.nodes) {
+      if (node && typeof node.getByteFrequencyData === 'function') return node;
+    }
+    return null;
+  };
+  const analyser = findAnalyser();
+  const usable = analyser && typeof analyser.getByteFrequencyData === 'function' && typeof analyser.getByteTimeDomainData === 'function' && analyser.frequencyBinCount > 0;
+  if (!usable) {
+    const graph = snapshot();
+    return { error: 'no_analyser', graph: graph.graph, graph_truncated: graph.truncated };
+  }
+  const mixer = (() => {
+    for (const key of ['__craftAnythingMixer', '__craftAnythingMixerState', 'audioMixerState', '__audioMixerState', 'mixerState']) {
+      let candidate;
+      try { candidate = window[key]; } catch (error) { continue; }
+      if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue;
+      try {
+        const copy = JSON.parse(JSON.stringify(candidate));
+        if (copy && typeof copy === 'object') return { source: key, state: copy };
+      } catch (error) {}
+    }
+    const layers = [];
+    let index = 0;
+    for (const node of tracker.nodes) {
+      if (layers.length >= MAX_LAYERS) break;
+      try {
+        if (node && node.gain && typeof node.gain.value === 'number') {
+          layers.push({ id: String(node.__layerId || ('layer_' + index)), gain: node.gain.value, pan: 0 });
+          index += 1;
+        } else if (node && node.pan && typeof node.pan.value === 'number') {
+          layers.push({ id: String(node.__layerId || ('layer_' + index)), gain: 1, pan: node.pan.value });
+          index += 1;
+        }
+      } catch (error) {}
+    }
+    const title = typeof document !== 'undefined' && document ? String(document.title || '').slice(0, 120) : '';
+    return { source: layers.length > 0 ? 'graph' : 'none', state: { scenario_id: title, layers: layers } };
+  })();
+  const fftSize = Math.max(1, Math.min(analyser.frequencyBinCount | 0, MAX_SPECTRUM));
+  const frequency = new Uint8Array(analyser.frequencyBinCount);
+  const waveform = new Uint8Array(analyser.fftSize);
+  const sums = new Float64Array(fftSize);
+  const rms = [];
+  let samples = 0, bucketSum = 0, bucketCount = 0, bucketStart = 0;
+  const started = performance.now();
+  while (true) {
+    const elapsed = performance.now() - started;
+    if (elapsed >= DURATION_MS) break;
+    analyser.getByteFrequencyData(frequency);
+    analyser.getByteTimeDomainData(waveform);
+    for (let index = 0; index < fftSize; index += 1) sums[index] += frequency[index] || 0;
+    let squares = 0;
+    for (let index = 0; index < waveform.length; index += 1) {
+      const value = (waveform[index] - 128) / 128;
+      squares += value * value;
+    }
+    bucketSum += waveform.length > 0 ? Math.sqrt(squares / waveform.length) : 0;
+    bucketCount += 1;
+    samples += 1;
+    if (elapsed - bucketStart >= 1000) {
+      if (rms.length < MAX_RMS) rms.push(bucketCount > 0 ? bucketSum / bucketCount : 0);
+      bucketSum = 0;
+      bucketCount = 0;
+      bucketStart += 1000;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  if (bucketCount > 0 && rms.length < MAX_RMS) rms.push(bucketSum / bucketCount);
+  const spectrum = [];
+  for (let index = 0; index < fftSize; index += 1) spectrum.push(samples > 0 ? sums[index] / samples : 0);
+  const graph = snapshot();
+  return {
+    graph: graph.graph,
+    graph_truncated: graph.truncated,
+    spectrum: spectrum,
+    spectrum_truncated: analyser.frequencyBinCount > MAX_SPECTRUM,
+    rms: rms,
+    mixer_state: mixer.state,
+    mixer_source: mixer.source,
+    mixer_envelope: [],
+    sample_rate: context.sampleRate,
+    fft_size: analyser.fftSize,
+    samples: samples,
+    duration_ms: Math.round(performance.now() - started)
+  };
+})()
+"#;
+
+fn audio_capture_script(duration_ms: u64) -> String {
+    AUDIO_CAPTURE_SCRIPT.replace("__DURATION_MS__", &duration_ms.to_string())
+}
+
+/// Validate and bound the page's audio report. A `null` result means the page has no
+/// AudioContext; `no_analyser` means it has a graph but nothing to read a spectrum from.
+fn parse_audio_capture_reply(reply: &Value) -> Result<Value, ToolError> {
+    let value = reply.get("result").and_then(|result| result.get("value")).cloned().unwrap_or(Value::Null);
+    if value.is_null() {
+        return Err(ToolError::new(ErrorCode::FeatureMissing, "the page has no AudioContext to listen to")
+            .with_remediation(
+                "Start the page's audio and try again: the capture found no AudioContext on the page. A page that keeps its audio context out of reach (not on window) reads the same even while it plays; it must expose its context on window (window.__craftAnythingAudioContext, or the __craftAnythingAudioContexts list, or a global named audioContext/ctx). Naming its analyser (window.__craftAnythingAudioAnalyser) tells the capture which node to read, but the context must be reachable first. If the sound plays in a cross-origin iframe, pass that frame's target_id.",
+            )
+            .with_details(json!({"reason": "no_audio_graph"})));
+    }
+    if !value.is_object() {
+        return Err(ToolError::new(ErrorCode::GarbledOutput, "the page's audio report wasn't an object").with_remediation("Reload the page and try again."));
+    }
+    if value.get("error").and_then(Value::as_str) == Some("no_analyser") {
+        return Err(ToolError::new(ErrorCode::FeatureMissing, "the page's audio graph has no AnalyserNode to read")
+            .with_remediation("Expose the page's analyser on window.__craftAnythingAudioAnalyser, or add an AnalyserNode to the graph, then capture again.")
+            .with_details(json!({"reason": "no_analyser"})));
+    }
+
+    let spectrum_all = value.get("spectrum").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+    let mut spectrum = number_list(&value, "spectrum")?;
+    spectrum.truncate(MAX_CAPTURE_SPECTRUM);
+    let mut rms = number_list(&value, "rms")?;
+    rms.truncate(MAX_CAPTURE_RMS);
+
+    let mut graph = value.get("graph").filter(|graph| graph.is_object()).cloned().unwrap_or_else(|| json!({"node_counts": {}, "edges": []}));
+    let mut graph_truncated = value.get("graph_truncated").and_then(Value::as_bool).unwrap_or(false);
+    if let Some(edges) = graph.get_mut("edges").and_then(Value::as_array_mut)
+        && edges.len() > MAX_CAPTURE_EDGES
+    {
+        edges.truncate(MAX_CAPTURE_EDGES);
+        graph_truncated = true;
+    }
+    if let Some(counts) = graph.get_mut("node_counts").and_then(Value::as_object_mut) {
+        while counts.len() > MAX_CAPTURE_KINDS {
+            let Some(kind) = counts.keys().next().cloned() else { break };
+            counts.remove(&kind);
+            graph_truncated = true;
+        }
+    }
+
+    let mixer = value.get("mixer_state").filter(|state| state.is_object()).cloned().unwrap_or_else(|| json!({}));
+    let mixer_bytes = serde_json::to_string(&mixer).map(|text| text.len()).unwrap_or(0);
+    if mixer_bytes > MAX_MIXER_BYTES {
+        return Err(ToolError::new(ErrorCode::OverLimit, format!("the page's mixer state is {mixer_bytes} bytes; at most {MAX_MIXER_BYTES} are kept"))
+            .with_remediation("Capture a page whose mixer state is smaller, or expose only the fields the comparison needs."));
+    }
+
+    let sample_rate = value.get("sample_rate").and_then(Value::as_u64).filter(|rate| (1..=384_000).contains(rate)).unwrap_or(48_000);
+    let fft_size = value.get("fft_size").and_then(Value::as_u64).unwrap_or(0);
+    let samples = value.get("samples").and_then(Value::as_u64).unwrap_or(0);
+    Ok(json!({
+        "graph": graph,
+        "graph_truncated": graph_truncated,
+        "spectrum": spectrum,
+        "spectrum_truncated": value.get("spectrum_truncated").and_then(Value::as_bool).unwrap_or(false) || spectrum_all > MAX_CAPTURE_SPECTRUM,
+        "rms": rms,
+        "mixer_state": mixer,
+        "mixer_source": value.get("mixer_source").and_then(Value::as_str).unwrap_or("none"),
+        "mixer_envelope": [],
+        "sample_rate": sample_rate,
+        "fft_size": fft_size,
+        "samples": samples,
+    }))
+}
+
+/// What one scripted interaction trace recorded.
+struct TraceRun {
+    /// The `(layer, gain, pan)` readings, in the order the page sampled them.
+    envelope: Vec<EnvelopeSample>,
+    /// How long the page sampler ran, in milliseconds.
+    traced_ms: u64,
+    /// Whether a cap (6000 readings or 60 seconds) or an unreadable row stopped the trace early.
+    truncated: bool,
+    /// Whether the sampler started at all (the page had an observable audio graph).
+    started: bool,
+    /// Why the trace stopped short of its scripted steps, if it did.
+    aborted: Option<String>,
+    /// Rows the page returned that no reading could be read from.
+    dropped: usize,
+    /// Layers whose gain was not observable and was recorded as unity.
+    defaulted_gain: u64,
+    /// Layers whose pan was not observable and was recorded as centre.
+    defaulted_pan: u64,
+    /// Whether the page's trace report was not a sample list at all.
+    unreadable: bool,
+}
+
+impl TraceRun {
+    fn untraced() -> Self {
+        TraceRun {
+            envelope: Vec::new(),
+            traced_ms: 0,
+            truncated: false,
+            started: false,
+            aborted: None,
+            dropped: 0,
+            defaulted_gain: 0,
+            defaulted_pan: 0,
+            unreadable: false,
+        }
+    }
+}
+
+/// The valid readings from a sampler report, plus what could not be read.
+struct TraceRows {
+    envelope: Vec<EnvelopeSample>,
+    /// Rows that were not a `{t_ms, layer_id, gain, pan}` reading.
+    dropped: usize,
+    /// Valid readings beyond the 6000-sample cap.
+    beyond_cap: usize,
+    /// Whether the report carried no sample list at all.
+    unreadable: bool,
+}
+
+/// Read the sampler's rows one at a time: a malformed row is counted, never allowed to erase the
+/// whole trace. A missing or non-list `samples` is `unreadable`, so the caller can say why rather
+/// than reporting an empty trace as a successful one.
+fn parse_trace_rows(samples: Value) -> TraceRows {
+    let Some(rows) = samples.as_array() else {
+        return TraceRows { envelope: Vec::new(), dropped: 0, beyond_cap: 0, unreadable: true };
+    };
+    let mut envelope = Vec::with_capacity(rows.len().min(MAX_TRACE_SAMPLES));
+    let mut dropped = 0usize;
+    let mut beyond_cap = 0usize;
+    for row in rows {
+        match serde_json::from_value::<MixerSample>(row.clone()) {
+            Ok(sample) if envelope.len() < MAX_TRACE_SAMPLES => envelope.push(EnvelopeSample::from(sample)),
+            Ok(_) => beyond_cap += 1,
+            Err(_) => dropped += 1,
+        }
+    }
+    TraceRows { envelope, dropped, beyond_cap, unreadable: false }
+}
+
+/// Start the 10 Hz page sampler, run the scripted steps, then collect the traced gain/pan
+/// trajectory. A step that fails or a deadline stops the run early and is reported, never fatal:
+/// the capture that already happened is still evidence.
+fn run_interaction_trace(client: &mut CdpClient, p: &CaptureAudioParams, secrets: &mut Secrets, ctx: &mut Ctx<'_>, dl: &Deadline) -> TraceRun {
+    let mut run = TraceRun::untraced();
+    let started = client
+        .call(
+            "Runtime.evaluate",
+            json!({
+                "expression": AUDIO_TRACE_START_SCRIPT.replace("__TRACE_PERIOD_MS__", &TRACE_PERIOD_MS.to_string()),
+                "awaitPromise": false,
+                "returnByValue": true
+            }),
+            None,
+            dl,
+        )
+        .ok()
+        .and_then(|reply| reply.pointer("/result/value/started").and_then(Value::as_bool))
+        .unwrap_or(false);
+    run.started = started;
+    if !started {
+        return run;
+    }
+
+    for (index, step) in p.steps.iter().enumerate().take(MAX_TRACE_STEPS) {
+        if dl.expired() {
+            run.aborted = Some("the overall deadline passed".into());
+            break;
+        }
+        ctx.report(Some(index as f32 / p.steps.len().max(1) as f32), format!("interaction trace step {}", index + 1));
+        // Each step and its settle are capped by the time left, so 200 steps cannot run past the
+        // deadline the caller advertised.
+        let step_dl = dl.slice(Duration::from_millis(30_000));
+        if let Err(error) = run_action(client, &step.action, secrets, &step_dl) {
+            run.aborted = Some(if dl.expired() { "the overall deadline passed".into() } else { format!("step {} failed: {}", index + 1, error.message) });
+            break;
+        }
+        // Let the 10 Hz poll take a reading after each step, so a stair-step move is visible.
+        let settle = dl.slice(Duration::from_millis(TRACE_SETTLE_MS));
+        let _ = client.pump_until(&settle);
+    }
+
+    let collected = client.call("Runtime.evaluate", json!({"expression": AUDIO_TRACE_STOP_SCRIPT, "awaitPromise": true, "returnByValue": true}), None, dl);
+    match collected {
+        Ok(reply) => {
+            let value = reply.get("result").and_then(|result| result.get("value")).cloned().unwrap_or(Value::Null);
+            run.traced_ms = value.get("traced_ms").and_then(Value::as_u64).unwrap_or(0).min(MAX_TRACE_MS);
+            run.truncated = value.get("truncated").and_then(Value::as_bool).unwrap_or(false);
+            run.defaulted_gain = value.get("defaulted_gain").and_then(Value::as_u64).unwrap_or(0);
+            run.defaulted_pan = value.get("defaulted_pan").and_then(Value::as_u64).unwrap_or(0);
+            let rows = parse_trace_rows(value.get("samples").cloned().unwrap_or(Value::Null));
+            run.unreadable = rows.unreadable;
+            run.dropped = rows.dropped;
+            run.truncated |= rows.dropped > 0 || rows.beyond_cap > 0;
+            run.envelope = rows.envelope;
+            if run.unreadable {
+                run.aborted.get_or_insert_with(|| "the trace report is unreadable (no sample list)".into());
+            }
+        }
+        Err(error) => {
+            run.aborted.get_or_insert_with(|| format!("the trace could not be collected: {}", error.message));
+        }
+    }
+    run
+}
+
+/// Start sampling every tracked layer's gain and pan at 10 Hz into `window.__craftAnythingMixerTrace`.
+/// Layer ids are assigned once per node (a `WeakMap`) so the same layer keeps its name across polls,
+/// including nodes the page created after the capture's instrumentation. A panner fed by a gain is
+/// folded into that gain's layer (identity links recorded by the capture script), and a missing gain
+/// or pan is filled with unity/centre but counted, so the result can name the default. Bounded to
+/// 6000 readings and 60 seconds; returns immediately so scripted steps can run while it polls.
+const AUDIO_TRACE_START_SCRIPT: &str = r#"
+(() => { // __craftAnythingTraceStart
+  const MAX_SAMPLES = 6000, MAX_MS = 60000, MAX_LAYERS = 64, PERIOD_MS = __TRACE_PERIOD_MS__;
+  const state = window.__craftAnythingAudioGraph;
+  if (!state || !(state.nodes instanceof Set)) return { started: false, reason: 'no_audio_graph' };
+  const ids = window.__craftAnythingLayerIds instanceof WeakMap ? window.__craftAnythingLayerIds : new WeakMap();
+  try { Object.defineProperty(window, '__craftAnythingLayerIds', { value: ids, configurable: true }); } catch (error) {}
+  let next = 0;
+  const nameOf = (node) => {
+    try {
+      const declared = node.__layerId;
+      if (typeof declared === 'string' && declared.length > 0) return declared.slice(0, 64);
+    } catch (error) {}
+    let id = ids.get(node);
+    if (!id) { id = 'layer_' + next; next += 1; ids.set(node, id); }
+    return id;
+  };
+  const paramOf = (node, name) => {
+    try {
+      const param = node ? node[name] : null;
+      return param && typeof param.value === 'number' && isFinite(param.value) ? param.value : null;
+    } catch (error) { return null; }
+  };
+  const trace = { samples: [], started: performance.now(), truncated: false, timer: 0, defaulted_gain: new Set(), defaulted_pan: new Set() };
+  const poll = () => {
+    const elapsed = performance.now() - trace.started;
+    if (elapsed >= MAX_MS) { trace.truncated = true; clearInterval(trace.timer); return; }
+    // Pair each gain with an adjacent pan-only panner (either direction), so one mixer layer is
+    // one reading. The capture script recorded identity links for every connection (read afresh
+    // each poll, so a layer the steps create is paired too); older tracker state has none.
+    const links = Array.isArray(state.links) ? state.links : [];
+    const downstreamPan = new Map(), upstreamPan = new Map(), absorbed = new Set();
+    for (const link of links) {
+      if (!Array.isArray(link)) continue;
+      const from = link[0], to = link[1];
+      if (!from || !to) continue;
+      const fromGain = paramOf(from, 'gain'), fromPan = paramOf(from, 'pan');
+      const toGain = paramOf(to, 'gain'), toPan = paramOf(to, 'pan');
+      if (fromGain !== null && toPan !== null && toGain === null) {
+        downstreamPan.set(from, to);
+        absorbed.add(to);
+      } else if (fromPan !== null && fromGain === null && toGain !== null) {
+        upstreamPan.set(to, from);
+        absorbed.add(from);
+      }
+    }
+    let layers = 0;
+    for (const node of state.nodes) {
+      const ownGain = paramOf(node, 'gain');
+      const ownPan = paramOf(node, 'pan');
+      if (ownGain === null && ownPan === null) continue;
+      // A panner paired with a gain belongs to that gain's layer; the gain emits the reading.
+      if (ownGain === null && absorbed.has(node)) continue;
+      if (layers >= MAX_LAYERS) { trace.truncated = true; break; }
+      layers += 1;
+      if (trace.samples.length >= MAX_SAMPLES) { trace.truncated = true; break; }
+      const id = nameOf(node);
+      let gain = ownGain, pan = ownPan;
+      if (gain === null) { gain = 1; trace.defaulted_gain.add(id); }
+      if (pan === null) {
+        const panner = downstreamPan.get(node) || upstreamPan.get(node);
+        const observed = panner ? paramOf(panner, 'pan') : null;
+        if (observed === null) { pan = 0; trace.defaulted_pan.add(id); } else { pan = observed; }
+      }
+      trace.samples.push({ t_ms: Math.round(elapsed), layer_id: id, gain: gain, pan: pan });
+    }
+  };
+  poll();
+  trace.timer = setInterval(poll, PERIOD_MS);
+  try { Object.defineProperty(window, '__craftAnythingMixerTrace', { value: trace, configurable: true }); } catch (error) {}
+  return { started: true };
+})()
+"#;
+
+/// Stop the sampler and return its readings and default counts, bounded once more on the way out.
+const AUDIO_TRACE_STOP_SCRIPT: &str = r#"
+(() => { // __craftAnythingTraceStop
+  const trace = window.__craftAnythingMixerTrace;
+  if (!trace) return { samples: [], truncated: false, traced_ms: 0, defaulted_gain: 0, defaulted_pan: 0 };
+  if (trace.timer) clearInterval(trace.timer);
+  const samples = Array.isArray(trace.samples) ? trace.samples : [];
+  return {
+    samples: samples.slice(0, 6000),
+    truncated: !!trace.truncated || samples.length > 6000,
+    traced_ms: Math.round(performance.now() - trace.started),
+    defaulted_gain: trace.defaulted_gain instanceof Set ? trace.defaulted_gain.size : 0,
+    defaulted_pan: trace.defaulted_pan instanceof Set ? trace.defaulted_pan.size : 0
+  };
+})()
+"#;
+
+/// An outline of the requests the page made while the capture listened: how many, their origins
+/// and a bounded endpoint list. Query values are dropped and declared secrets are redacted.
+///
+/// `enabled` is whether `Network.enable` succeeded; when it didn't, or when the event queue
+/// overflowed, the outline says so instead of looking like a page that made no requests.
+fn audio_network_outline(client: &mut CdpClient, secrets: &mut Secrets, enabled: bool) -> Value {
+    use std::collections::{BTreeMap, BTreeSet};
+    let dropped = client.dropped_events();
+    let events = client.take_events();
+    let mut count = 0u64;
+    let mut origins: BTreeMap<String, u64> = BTreeMap::new();
+    let mut endpoints: Vec<Value> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut truncated = false;
+    for event in &events {
+        if event.method != "Network.requestWillBeSent" {
+            continue;
+        }
+        count = count.saturating_add(1);
+        let url = secrets.text(&web_common::sanitize_url(event.params.pointer("/request/url").and_then(Value::as_str).unwrap_or_default()));
+        let (origin, path) = split_origin_path(&url);
+        if !origin.is_empty() {
+            let entry = origins.entry(origin.clone()).or_insert(0);
+            *entry = entry.saturating_add(1);
+        }
+        let method = event.params.pointer("/request/method").and_then(Value::as_str).unwrap_or("GET");
+        let endpoint = format!("{origin}{path}");
+        if seen.insert(format!("{method} {endpoint}")) {
+            if endpoints.len() < MAX_OUTLINE_ENDPOINTS {
+                endpoints.push(json!({"method": method, "endpoint": endpoint}));
+            } else {
+                truncated = true;
+            }
+        }
+    }
+    let mut unavailable: Vec<&str> = Vec::new();
+    if !enabled {
+        unavailable.push("network (the browser refused Network.enable)");
+    }
+    if dropped > 0 {
+        unavailable.push("some events (the browser event queue overflowed)");
+    }
+    json!({"request_count": count, "origins": origins, "endpoints": endpoints, "truncated": truncated, "dropped": dropped, "unavailable": unavailable})
+}
+
+/// Origin and path of a URL, with the query and fragment dropped. A relative or malformed URL
+/// keeps no origin.
+fn split_origin_path(url: &str) -> (String, String) {
+    let url = url.trim();
+    let Some(scheme_end) = url.find("://") else {
+        return (String::new(), url.split(['?', '#']).next().unwrap_or("").to_string());
+    };
+    let authority_start = scheme_end + 3;
+    let rest = url.get(authority_start..).unwrap_or("");
+    let (authority, tail) = match rest.find(['/', '?', '#']) {
+        Some(at) => rest.split_at(at),
+        None => (rest, ""),
+    };
+    let origin = format!("{}{}", url.get(..authority_start).unwrap_or(""), authority);
+    (origin, tail.split(['?', '#']).next().unwrap_or("").to_string())
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)).unwrap_or(0)
+}
+
+/// At most `max` characters, with an ellipsis when the text was cut.
+fn clip_text(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+// ---------------------------------------------------------------------------------------------
+// web_audio_offline_render (Deep-only: renders a recipe in a headless OfflineAudioContext)
+
+/// The recipe format this build renders.
+const OFFLINE_RECIPE_VERSION: u32 = 1;
+/// Most layers one offline render accepts.
+const MAX_OFFLINE_LAYERS: usize = 256;
+/// Largest offline render, in frames: two channels of 32-bit floats stay around 64 MB.
+const MAX_OFFLINE_FRAMES: u64 = 8_000_000;
+/// Most spectrum values an offline render keeps (an 8192-point FFT has 4096 bins).
+const MAX_OFFLINE_SPECTRUM: usize = 4_096;
+/// Most loudness values an offline render keeps (ten minutes at one per second).
+const MAX_OFFLINE_RMS: usize = 600;
+/// Oscillator waveforms an offline recipe may ask for.
+const OFFLINE_WAVES: &[&str] = &["sine", "square", "sawtooth", "triangle"];
+/// Biquad filter kinds an offline recipe may ask for.
+const OFFLINE_FILTERS: &[&str] = &["lowpass", "highpass", "bandpass", "notch", "peaking", "lowshelf", "highshelf"];
+/// Most gain/pan points one layer's declared envelope may hold (ten minutes at 10 Hz).
+const MAX_OFFLINE_ENVELOPE: usize = 6_000;
+/// Most mixer readings the fingerprint keeps; a recipe's envelopes share this budget, so each
+/// layer's even grid is only as fine as its share allows.
+const MAX_OFFLINE_ENVELOPE_TOTAL: usize = 6_000;
+/// Target spacing for an offline envelope, in milliseconds. The actual even spacing is the
+/// layer's last declared time divided by `points - 1`, so it is at most this unless the recipe's
+/// envelopes have to share the reading budget.
+const OFFLINE_ENVELOPE_STEP_MS: u64 = 100;
+
+/// The audio scene to rebuild: a version, the scenario it stands for, and its layers.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineRecipe {
+    /// Format version; this build renders version 1.
+    #[serde(default = "d_recipe_version")]
+    pub version: u32,
+    /// The scenario this recipe rebuilds, e.g. "focus"; it becomes the fingerprint's scenario.
+    #[serde(default)]
+    pub scenario_id: Option<String>,
+    /// The layers to render, in order; at most 256.
+    #[serde(default)]
+    pub layers: Vec<OfflineLayer>,
+}
+
+/// One oscillator layer: a waveform, an optional filter, then gain and pan.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineLayer {
+    /// Your name for the layer, kept in the mixer state (default `layer_<index>`).
+    #[serde(default)]
+    pub id: Option<String>,
+    /// The layer kind; this build renders `oscillator`.
+    #[serde(default = "d_layer_kind")]
+    pub kind: String,
+    /// Oscillator waveform: sine, square, sawtooth or triangle.
+    #[serde(default = "d_layer_wave")]
+    pub wave: String,
+    /// Oscillator frequency in Hz (20..=20000; default 220).
+    #[serde(default = "d_layer_frequency")]
+    pub frequency: f64,
+    /// Layer gain (0..=2; default 0.5).
+    #[serde(default = "d_layer_gain")]
+    pub gain: f64,
+    /// Stereo position (-1..=1; default 0, which adds no panner node).
+    #[serde(default)]
+    pub pan: f64,
+    /// An optional biquad filter placed before the gain.
+    #[serde(default)]
+    pub filter: Option<OfflineFilter>,
+    /// An optional gain/pan trajectory, scheduled as a value curve before the render starts.
+    /// Give at least two points, non-decreasing in `t_ms`; each gain is 0..=2 and each pan -1..=1.
+    #[serde(default)]
+    pub envelope: Option<Vec<OfflineEnvelopePoint>>,
+}
+
+/// One gain/pan point of a layer's offline trajectory, at a moment since the render began.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineEnvelopePoint {
+    /// Milliseconds since the render began.
+    pub t_ms: u64,
+    /// Layer gain at that moment (0..=2).
+    pub gain: f64,
+    /// Stereo pan at that moment (-1..=1).
+    pub pan: f64,
+}
+
+/// A biquad filter in an offline recipe.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineFilter {
+    /// Filter kind: lowpass, highpass, bandpass, notch, peaking, lowshelf or highshelf.
+    #[serde(default = "d_filter_kind")]
+    pub kind: String,
+    /// Cutoff or centre frequency in Hz (20..=20000; default 1000).
+    #[serde(default = "d_filter_frequency")]
+    pub frequency: f64,
+    /// Filter Q (0.0001..=1000; default 0.707).
+    #[serde(default = "d_filter_q")]
+    pub q: f64,
+}
+
+fn d_recipe_version() -> u32 {
+    OFFLINE_RECIPE_VERSION
+}
+
+fn d_layer_kind() -> String {
+    "oscillator".into()
+}
+
+fn d_layer_wave() -> String {
+    "sine".into()
+}
+
+fn d_layer_frequency() -> f64 {
+    220.0
+}
+
+fn d_layer_gain() -> f64 {
+    0.5
+}
+
+fn d_filter_kind() -> String {
+    "lowpass".into()
+}
+
+fn d_filter_frequency() -> f64 {
+    1_000.0
+}
+
+fn d_filter_q() -> f64 {
+    0.707
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineRenderParams {
+    /// Loopback CDP endpoint, e.g. http://127.0.0.1:9222. Omit to launch a browser.
+    #[serde(default)]
+    pub cdp_endpoint: Option<String>,
+    /// Launch a located Chromium when no endpoint is given.
+    #[serde(default)]
+    pub launch: bool,
+    /// Launch headless (when launching).
+    #[serde(default = "yes")]
+    pub headless: bool,
+    /// Pass --no-sandbox when launching (needed in some containers).
+    #[serde(default)]
+    pub no_sandbox: bool,
+    /// The page target to render in (default: the first page).
+    #[serde(default)]
+    pub target_id: Option<String>,
+    /// The audio scene to render: {version: 1, scenario_id, layers: [...]}.
+    pub recipe: OfflineRecipe,
+    /// How much audio to render, in milliseconds (1..=120000; default 30000).
+    #[serde(default = "d_offline_duration_ms")]
+    pub duration_ms: u64,
+    /// Render sample rate in Hz (8000..=96000; default 48000).
+    #[serde(default = "d_offline_sample_rate")]
+    pub sample_rate: u32,
+    /// Overall limit for the whole render, in seconds (1..=600).
+    #[serde(default = "d_offline_timeout")]
+    pub timeout_secs: u64,
+    /// Values to redact wherever they appear in the result (names, labels).
+    #[serde(default)]
+    pub hidden_values: Vec<String>,
+}
+
+fn d_offline_duration_ms() -> u64 {
+    30_000
+}
+
+fn d_offline_sample_rate() -> u32 {
+    48_000
+}
+
+fn d_offline_timeout() -> u64 {
+    120
+}
+
+fn web_audio_offline_render(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
+    let p: OfflineRenderParams = parse_params(params)?;
+    if !(1..=120_000).contains(&p.duration_ms) {
+        return Err(ToolError::invalid(format!("duration_ms must be 1..=120000; {} is outside that window", p.duration_ms))
+            .with_remediation("Render at least a millisecond and at most two minutes of audio."));
+    }
+    if !(8_000..=96_000).contains(&p.sample_rate) {
+        return Err(ToolError::invalid(format!("sample_rate must be 8000..=96000; {} is outside that window", p.sample_rate))
+            .with_remediation("Use a browser-supported sample rate such as 44100 or 48000."));
+    }
+    let frames = u128::from(p.duration_ms).saturating_mul(u128::from(p.sample_rate)) / 1_000;
+    if frames > u128::from(MAX_OFFLINE_FRAMES) {
+        return Err(ToolError::new(
+            ErrorCode::OverLimit,
+            format!("rendering {} ms at {} Hz needs {frames} frames; at most {MAX_OFFLINE_FRAMES} are rendered", p.duration_ms, p.sample_rate),
+        )
+        .with_remediation("Render a shorter window or a lower sample rate."));
+    }
+    let plan = offline_recipe_plan(&p.recipe, p.duration_ms)?;
+    let expression = offline_render_script(&plan, p.duration_ms, p.sample_rate)?;
+
+    let dl = deadline(ctx, p.timeout_secs)?;
+    let launch = p.launch || p.cdp_endpoint.is_none();
+    let browser = resolve_browser(ctx, p.cdp_endpoint.as_deref(), launch, p.headless, p.no_sandbox, &dl)?;
+    let targets = cdp::json_list(&browser.endpoint, &dl)?;
+    let target = web_common::pick_target(&targets, p.target_id.as_deref(), Some("page"))?;
+    let mut client = web_common::connect_target(&browser, target, PAGE_MAX_MESSAGE, &dl)?;
+    // Runtime runs the recipe; no page domain is touched and nothing is navigated.
+    let _ = client.call("Runtime.enable", json!({}), None, &dl);
+    let reply = match client.call(
+        "Runtime.evaluate",
+        json!({
+            "expression": expression,
+            "awaitPromise": true,
+            "returnByValue": true,
+            "userGesture": true,
+        }),
+        None,
+        &dl,
+    ) {
+        Ok(reply) => reply,
+        Err(error) => return cleanup_then_err(&mut client, &dl, error),
+    };
+    if let Some(details) = reply.get("exceptionDetails") {
+        let text = details
+            .pointer("/exception/description")
+            .and_then(Value::as_str)
+            .or_else(|| details.get("text").and_then(Value::as_str))
+            .unwrap_or("the offline render script failed");
+        let error = ToolError::new(ErrorCode::ProgramFailed, format!("the page rejected the offline render: {}", clip_text(text, 400)))
+            .with_remediation("Reload the page and try again; a Content-Security-Policy that blocks injected scripts also blocks this render.");
+        return cleanup_then_err(&mut client, &dl, error);
+    }
+    let report = match parse_offline_render_reply(&reply) {
+        Ok(report) => report,
+        Err(error) => return cleanup_then_err(&mut client, &dl, error),
+    };
+    cleanup(&mut client, &dl);
+
+    let spectrum = number_list(&report, "spectrum")?;
+    let rms = number_list(&report, "rms")?;
+    let graph = report.get("graph").cloned().unwrap_or(Value::Null);
+    let mixer = report.get("mixer_state").cloned().unwrap_or_else(|| json!({}));
+    // The recipe's gain/pan trajectories are what the render scheduled; keeping them in the
+    // fingerprint lets `web_audio_compare` check that a rebuild moves the mix the same way.
+    let recipe_envelope = offline_recipe_envelope(&plan);
+    let mut fingerprint = audio::fingerprint_from_capture(&spectrum, &rms, graph, mixer, &recipe_envelope)?;
+    fingerprint.sample_rate =
+        report.get("sample_rate").and_then(Value::as_u64).and_then(|rate| u32::try_from(rate).ok()).filter(|rate| *rate > 0).unwrap_or(p.sample_rate);
+    fingerprint.captured_at_ms = now_unix_ms();
+    fingerprint.deep_mode = !ctx.session.clean_room();
+
+    let rendered_ms = report.get("rendered_ms").and_then(Value::as_u64).filter(|ms| (1..=120_000).contains(ms)).unwrap_or(p.duration_ms);
+    let node_count: u64 = fingerprint.graph_signature.node_counts.values().copied().fold(0u64, u64::saturating_add);
+    let edge_count = fingerprint.graph_signature.edges.len();
+    let kind_count = fingerprint.graph_signature.node_counts.len();
+    let log_bin_count = fingerprint.log_bins.len();
+    let rms_count = fingerprint.rms_envelope.len();
+    let envelope_count = fingerprint.mixer_envelope.len();
+    let fingerprint_sample_rate = fingerprint.sample_rate;
+    let scenario = if fingerprint.scenario_id.is_empty() { "an offline render".to_string() } else { fingerprint.scenario_id.clone() };
+    let mut secrets = Secrets::new(&p.hidden_values);
+    let name = secrets.text(&scenario);
+
+    let result = json!({
+        "fingerprint": fingerprint,
+        "rendered_ms": rendered_ms,
+        "browser": {"product": browser.product, "started_by": if browser.launched { "craft-anything" } else { "external" }, "cleanup": if browser.launched { "closed" } else { "disconnected" }},
+        "recipe": {
+            "version": OFFLINE_RECIPE_VERSION,
+            "scenario_id": p.recipe.scenario_id,
+            "layers": p.recipe.layers.len(),
+            "duration_ms": p.duration_ms,
+            "sample_rate": p.sample_rate,
+            "envelope_points": envelope_count,
+        },
+        "spectrum_values": spectrum.len(),
+        "rms_values": rms_count,
+        "truncated": report.get("truncated").and_then(Value::as_bool).unwrap_or(false),
+        "graph_nodes": node_count,
+        "graph_edges": edge_count,
+        "secrets_hidden": p.hidden_values.len(),
+        "secret_redactions": 0,
+    });
+    let mut result = secrets.scrub(&result);
+    if let Some(object) = result.as_object_mut() {
+        object.insert("secret_redactions".into(), json!(secrets.redactions));
+    }
+    let summary = format!(
+        "Rendered {name} offline in {rendered_ms} ms: {log_bin_count} log bin(s), {rms_count} loudness value(s), {node_count} graph node(s) across {kind_count} kind(s) at {fingerprint_sample_rate} Hz."
+    );
+
+    let mut builder = EvidenceBuilder::new(
+        "web_audio_offline_render",
+        Subject { kind: "audio-scene".into(), sha256: None, name: Some(name) },
+        browser_env(ctx.session.clean_room(), &browser),
+    )
+    .params(json!({
+        "endpoint": browser.endpoint.origin,
+        "launched": browser.launched,
+        "duration_ms": p.duration_ms,
+        "sample_rate": p.sample_rate,
+        "recipe_version": OFFLINE_RECIPE_VERSION,
+        "layers": p.recipe.layers.len(),
+        "target_id": p.target_id,
+        "sensitive_value_declarations": p.hidden_values.len(),
+    }))
+    .result(result)
+    .summary(summary)
+    .confidence(Confidence::Observed)
+    .authority(Authority::OurRun)
+    .limitation(Limitation::new(
+        "offline_render_not_the_page",
+        "This is the recipe rendered offline, not the page's own audio: it matches only as far as the recipe reproduces the page's graph, settings and loudness.",
+    ))
+    .limitation(Limitation::new(
+        "single_window_spectrum",
+        "The spectrum is one FFT window from the middle of the render, not a time-averaged spectrum; the loudness envelope is one value per second.",
+    ))
+    .coverage(Coverage::complete(1))
+    .location(Location::new("url", browser.endpoint.origin.clone()));
+    if envelope_count > 0 {
+        builder = builder.limitation(Limitation::new(
+            "envelope_from_recipe",
+            "The mixer envelope is the recipe's scheduled gain/pan trajectory, not an observed one: it shows what the rebuild was told to do.",
+        ));
+        builder = builder.limitation(Limitation::new(
+            "envelope_resampled",
+            "The declared envelope is resampled to an even grid: each value sits at the layer's last point divided by (values - 1), targeting 100 ms but coarser when the recipe's envelopes share the fingerprint's 6000-reading budget. The fingerprint records those positions rounded to the nearest millisecond.",
+        ));
+    } else {
+        builder = builder.limitation(Limitation::new(
+            "no_interaction_trace",
+            "An offline render has no live interaction, so mixer_envelope is empty and only the recipe's layer settings are recorded.",
+        ));
+    }
+    if p.recipe.layers.is_empty() {
+        builder = builder.limitation(Limitation::new("empty_recipe", "The recipe had no layers, so the render is silent and its fingerprint has no energy."));
+    }
+    if report.get("truncated").and_then(Value::as_bool).unwrap_or(false) {
+        builder =
+            builder.limitation(Limitation::new("bounded_render", "Some graph edges, node kinds or spectrum bins were dropped to keep the result bounded."));
+    }
+    if p.hidden_values.iter().any(|value| !value.is_empty()) {
+        builder = builder.limitation(Limitation::new("secrets_redacted", format!("{} occurrence(s) of declared values were redacted", secrets.redactions)));
+    }
+    Ok(ToolOutput::evidence(builder.build()?))
+}
+
+/// Validate the recipe and turn it into the bounded object the page script embeds. `duration_ms`
+/// bounds every envelope point: a trajectory that runs past the render cannot be scheduled as
+/// written, so it is refused rather than silently cut.
+fn offline_recipe_plan(recipe: &OfflineRecipe, duration_ms: u64) -> Result<Value, ToolError> {
+    if recipe.version != OFFLINE_RECIPE_VERSION {
+        return Err(ToolError::invalid(format!(
+            "audio recipe version {} is not supported; this build renders version {OFFLINE_RECIPE_VERSION}",
+            recipe.version
+        ))
+        .with_remediation("Write the recipe with `version: 1`, or re-export it with this build."));
+    }
+    if recipe.layers.len() > MAX_OFFLINE_LAYERS {
+        return Err(ToolError::new(ErrorCode::OverLimit, format!("the recipe has {} layers; at most {MAX_OFFLINE_LAYERS} are rendered", recipe.layers.len()))
+            .with_remediation("Merge similar layers, or render the scene in a few recipes."));
+    }
+    // Every envelope shares the fingerprint's reading budget. Count the layers with one first, so
+    // a legal long render (up to 120 s per layer) is not refused for the internal resample grid;
+    // each layer's share only widens its own spacing.
+    let envelope_layers = recipe.layers.iter().filter(|layer| layer.envelope.as_deref().is_some_and(|points| !points.is_empty())).count();
+    let per_layer_points = MAX_OFFLINE_ENVELOPE_TOTAL.checked_div(envelope_layers).unwrap_or(MAX_OFFLINE_ENVELOPE).max(2);
+    let mut layers = Vec::with_capacity(recipe.layers.len());
+    for (index, layer) in recipe.layers.iter().enumerate() {
+        if layer.kind != "oscillator" {
+            return Err(ToolError::invalid(format!("layers[{index}].kind is {:?}; this build renders \"oscillator\"", layer.kind))
+                .with_remediation("Give each layer `kind: \"oscillator\"`; other node kinds arrive in a later recipe version."));
+        }
+        if !OFFLINE_WAVES.contains(&layer.wave.as_str()) {
+            return Err(ToolError::invalid(format!("layers[{index}].wave is {:?}; expected one of {}", layer.wave, OFFLINE_WAVES.join(", ")))
+                .with_remediation("Use a standard oscillator waveform: sine, square, sawtooth or triangle."));
+        }
+        let frequency = checked_offline_range(&format!("layers[{index}].frequency"), layer.frequency, 20.0, 20_000.0)?;
+        let gain = checked_offline_range(&format!("layers[{index}].gain"), layer.gain, 0.0, 2.0)?;
+        let pan = checked_offline_range(&format!("layers[{index}].pan"), layer.pan, -1.0, 1.0)?;
+        let id: String = layer.id.as_deref().unwrap_or("").chars().take(64).collect();
+        let id = if id.is_empty() { format!("layer_{index}") } else { id };
+        let envelope = offline_envelope_points(&format!("layers[{index}].envelope"), layer.envelope.as_deref(), duration_ms, per_layer_points)?;
+        let filter = match &layer.filter {
+            None => Value::Null,
+            Some(filter) => {
+                if !OFFLINE_FILTERS.contains(&filter.kind.as_str()) {
+                    return Err(ToolError::invalid(format!(
+                        "layers[{index}].filter.kind is {:?}; expected one of {}",
+                        filter.kind,
+                        OFFLINE_FILTERS.join(", ")
+                    ))
+                    .with_remediation("Use a standard biquad filter type, e.g. `lowpass`."));
+                }
+                json!({
+                    "kind": filter.kind,
+                    "frequency": checked_offline_range(&format!("layers[{index}].filter.frequency"), filter.frequency, 20.0, 20_000.0)?,
+                    "q": checked_offline_range(&format!("layers[{index}].filter.q"), filter.q, 0.0001, 1_000.0)?,
+                })
+            }
+        };
+        layers.push(json!({"id": id, "kind": "oscillator", "wave": layer.wave, "frequency": frequency, "gain": gain, "pan": pan, "filter": filter, "envelope": envelope}));
+    }
+    let scenario_id: String = recipe.scenario_id.as_deref().unwrap_or("").chars().take(120).collect();
+    Ok(json!({"version": OFFLINE_RECIPE_VERSION, "scenario_id": scenario_id, "layers": layers}))
+}
+
+/// Validate one layer's gain/pan trajectory, then resample it to an even grid whose target
+/// spacing is [`OFFLINE_ENVELOPE_STEP_MS`], limited to `max_points` (the layer's share of the
+/// fingerprint's reading budget). Requiring at least two points, non-decreasing times, gain
+/// 0..=2, pan -1..=1, no point past `duration_ms`, and at most [`MAX_OFFLINE_ENVELOPE`] declared
+/// points. Layers without an envelope become an empty list.
+///
+/// `setValueCurveAtTime` spreads its values evenly over the span, so the actual spacing is the
+/// layer's last declared time divided by `points - 1`: at most the 100 ms target, but coarser when
+/// the recipe's envelopes share the budget. Every value sits at that even position; the
+/// fingerprint records it to the nearest millisecond, which is where the render played it.
+fn offline_envelope_points(name: &str, points: Option<&[OfflineEnvelopePoint]>, duration_ms: u64, max_points: usize) -> Result<Vec<Value>, ToolError> {
+    let Some(points) = points.filter(|points| !points.is_empty()) else { return Ok(Vec::new()) };
+    if points.len() > MAX_OFFLINE_ENVELOPE {
+        return Err(ToolError::new(ErrorCode::OverLimit, format!("{name} holds {} points; at most {MAX_OFFLINE_ENVELOPE} are rendered", points.len()))
+            .with_remediation("Give the layer a coarser trajectory (at most ten minutes at 10 Hz)."));
+    }
+    if points.len() < 2 {
+        return Err(ToolError::invalid(format!("{name} needs at least two points; a single point has no trajectory"))
+            .with_remediation("Add a second {t_ms, gain, pan} point, or omit the envelope and set the layer's gain and pan."));
+    }
+    let mut declared: Vec<(u64, f64, f64)> = Vec::with_capacity(points.len());
+    let mut previous = 0u64;
+    for (at, point) in points.iter().enumerate() {
+        if at > 0 && point.t_ms < previous {
+            return Err(ToolError::invalid(format!("{name}[{at}].t_ms is {} but the point before it is at {previous} ms", point.t_ms))
+                .with_remediation("Order the envelope's points by time, earliest first."));
+        }
+        if point.t_ms > duration_ms {
+            return Err(ToolError::invalid(format!("{name}[{at}].t_ms is {} ms but the render is only {duration_ms} ms", point.t_ms))
+                .with_remediation("Render at least as long as the envelope's last point, or shorten the trajectory."));
+        }
+        previous = point.t_ms;
+        declared.push((
+            point.t_ms,
+            checked_offline_range(&format!("{name}[{at}].gain"), point.gain, 0.0, 2.0)?,
+            checked_offline_range(&format!("{name}[{at}].pan"), point.pan, -1.0, 1.0)?,
+        ));
+    }
+    let last = declared.last().map(|point| point.0).unwrap_or(0);
+    if last == 0 {
+        return Err(ToolError::invalid(format!("{name} ends at 0 ms; a trajectory needs time to play"))
+            .with_remediation("Move the last point to at least a millisecond after the first."));
+    }
+    let max_points = max_points.clamp(2, MAX_OFFLINE_ENVELOPE);
+    let span = last.div_ceil(OFFLINE_ENVELOPE_STEP_MS).saturating_add(1).min(max_points as u64).max(2);
+    let mut out = Vec::with_capacity(usize::try_from(span).unwrap_or(MAX_OFFLINE_ENVELOPE));
+    for index in 0..span {
+        let at = ((index as f64) * (last as f64) / ((span - 1) as f64)).round() as u64;
+        let (gain, pan) = interpolate_envelope(&declared, at);
+        out.push(json!({"t_ms": at.min(last), "gain": gain, "pan": pan}));
+    }
+    Ok(out)
+}
+
+/// Linear interpolation of a validated, time-ordered envelope at `at`; past either end the nearest
+/// declared point wins.
+fn interpolate_envelope(points: &[(u64, f64, f64)], at: u64) -> (f64, f64) {
+    let Some(&first) = points.first() else { return (0.0, 0.0) };
+    let mut left = first;
+    for &right in points {
+        if right.0 == at {
+            return (right.1, right.2);
+        }
+        if right.0 > at {
+            let span = (right.0 - left.0) as f64;
+            if span <= 0.0 {
+                return (right.1, right.2);
+            }
+            let along = (at.saturating_sub(left.0)) as f64 / span;
+            return (left.1 + (right.1 - left.1) * along, left.2 + (right.2 - left.2) * along);
+        }
+        left = right;
+    }
+    (left.1, left.2)
+}
+
+/// The scheduled gain/pan trajectory of a validated recipe, as fingerprint samples.
+fn offline_recipe_envelope(plan: &Value) -> Vec<EnvelopeSample> {
+    let mut out = Vec::new();
+    for layer in plan.get("layers").and_then(Value::as_array).into_iter().flatten() {
+        let Some(id) = layer.get("id").and_then(Value::as_str) else { continue };
+        for point in layer.get("envelope").and_then(Value::as_array).into_iter().flatten() {
+            if out.len() >= MAX_TRACE_SAMPLES {
+                return out;
+            }
+            let t_ms = point.get("t_ms").and_then(Value::as_u64).unwrap_or(0);
+            let gain = point.get("gain").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            let pan = point.get("pan").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            out.push(EnvelopeSample { t_ms, layer_id: id.to_string(), gain, pan });
+        }
+    }
+    out
+}
+
+fn checked_offline_range(name: &str, value: f64, low: f64, high: f64) -> Result<f64, ToolError> {
+    if !value.is_finite() || !(low..=high).contains(&value) {
+        return Err(ToolError::invalid(format!("{name} must be {low}..={high}; {value} is outside that range"))
+            .with_remediation("Use finite numbers: a frequency of 20 to 20000 Hz, a gain of 0 to 2, a pan of -1 to 1, and a positive Q."));
+    }
+    Ok(value)
+}
+
+/// The page script with the validated recipe and render window substituted.
+fn offline_render_script(plan: &Value, duration_ms: u64, sample_rate: u32) -> Result<String, ToolError> {
+    let recipe = serde_json::to_string(plan)
+        .map_err(|error| ToolError::internal(format!("couldn't encode the audio recipe: {error}")))?
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029");
+    Ok(OFFLINE_RENDER_SCRIPT
+        .replace("__RECIPE__", &recipe)
+        .replace("__DURATION_MS__", &duration_ms.to_string())
+        .replace("__SAMPLE_RATE__", &sample_rate.to_string()))
+}
+
+/// Build the recipe in an OfflineAudioContext, render it, then measure one FFT window and a 1 Hz
+/// loudness envelope from the rendered buffer. Bounded throughout; returns an `error` object rather
+/// than throwing for the cases the caller names (no OfflineAudioContext, a failed render or layer).
+const OFFLINE_RENDER_SCRIPT: &str = r#"
+(async () => {
+  const RECIPE = __RECIPE__;
+  const DURATION_MS = __DURATION_MS__;
+  const SAMPLE_RATE = __SAMPLE_RATE__;
+  const MAX_LAYERS = 256, MAX_SPECTRUM = 4096, MAX_RMS = 600, FFT_SIZE = 8192, MAX_EDGES = 2000;
+  const clampNumber = (value, low, high, fallback) => {
+    const n = typeof value === 'number' && isFinite(value) ? value : fallback;
+    return Math.max(low, Math.min(high, n));
+  };
+  const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  if (!OAC) return { error: 'no_offline_audio_context' };
+  const frames = Math.max(1, Math.round(DURATION_MS * SAMPLE_RATE / 1000));
+  const seconds = frames / SAMPLE_RATE;
+  const ctx = new OAC(2, frames, SAMPLE_RATE);
+  const counts = {}, edges = [];
+  const add = (kind) => { counts[kind] = (counts[kind] || 0) + 1; };
+  const link = (from, to) => {
+    if (edges.length < MAX_EDGES) edges.push({ from: String(from).slice(0, 64), to: String(to).slice(0, 64), kind: 'audio' });
+  };
+  const bus = ctx.createAnalyser();
+  add('analyser');
+  bus.connect(ctx.destination);
+  add('audio_destination');
+  link('analyser', 'audio_destination');
+  const layers = Array.isArray(RECIPE.layers) ? RECIPE.layers.slice(0, MAX_LAYERS) : [];
+  for (let index = 0; index < layers.length; index += 1) {
+    const layer = layers[index] || {};
+    try {
+      const source = ctx.createOscillator();
+      source.type = layer.wave || 'sine';
+      source.frequency.setValueAtTime(typeof layer.frequency === 'number' ? layer.frequency : 220, 0);
+      add('oscillator');
+      let tail = source, tailKind = 'oscillator';
+      if (layer.filter) {
+        const node = ctx.createBiquadFilter();
+        node.type = layer.filter.kind || 'lowpass';
+        node.frequency.setValueAtTime(typeof layer.filter.frequency === 'number' ? layer.filter.frequency : 1000, 0);
+        node.Q.setValueAtTime(typeof layer.filter.q === 'number' ? layer.filter.q : 0.707, 0);
+        add('biquad_filter');
+        tail.connect(node);
+        link(tailKind, 'biquad_filter');
+        tail = node;
+        tailKind = 'biquad_filter';
+      }
+      const gain = ctx.createGain();
+      const envelope = Array.isArray(layer.envelope) ? layer.envelope : [];
+      const hasCurve = envelope.length >= 2;
+      // setValueCurveAtTime needs a span: the last point's time, bounded to the render window.
+      const span = hasCurve ? Math.max(0.001, Math.min(DURATION_MS, Number(envelope[envelope.length - 1].t_ms) || 0) / 1000) : 0;
+      if (hasCurve) {
+        const curve = new Float32Array(envelope.length);
+        for (let k = 0; k < envelope.length; k += 1) curve[k] = clampNumber(envelope[k] && envelope[k].gain, 0, 2, 0.5);
+        gain.gain.setValueCurveAtTime(curve, 0, span);
+      } else {
+        gain.gain.setValueAtTime(typeof layer.gain === 'number' ? layer.gain : 0.5, 0);
+      }
+      add('gain');
+      tail.connect(gain);
+      link(tailKind, 'gain');
+      tail = gain;
+      tailKind = 'gain';
+      if (hasCurve || (typeof layer.pan === 'number' && layer.pan !== 0)) {
+        const panner = ctx.createStereoPanner();
+        if (hasCurve) {
+          const curve = new Float32Array(envelope.length);
+          for (let k = 0; k < envelope.length; k += 1) curve[k] = clampNumber(envelope[k] && envelope[k].pan, -1, 1, 0);
+          panner.pan.setValueCurveAtTime(curve, 0, span);
+        } else {
+          panner.pan.setValueAtTime(layer.pan, 0);
+        }
+        add('stereo_panner');
+        tail.connect(panner);
+        link(tailKind, 'stereo_panner');
+        tail = panner;
+        tailKind = 'stereo_panner';
+      }
+      tail.connect(bus);
+      link(tailKind, 'analyser');
+      source.start(0);
+      source.stop(seconds);
+    } catch (error) {
+      return { error: 'layer_failed', message: String((error && error.message) || error).slice(0, 200), layer: index };
+    }
+  }
+  let buffer;
+  try {
+    buffer = await ctx.startRendering();
+  } catch (error) {
+    return { error: 'render_failed', message: String((error && error.message) || error).slice(0, 200) };
+  }
+  const channels = [];
+  for (let c = 0; c < buffer.numberOfChannels; c += 1) channels.push(buffer.getChannelData(c));
+  const rms = [];
+  const per = Math.max(1, Math.round(SAMPLE_RATE));
+  const rmsCount = Math.min(MAX_RMS, Math.ceil(buffer.length / per));
+  for (let bucket = 0; bucket < rmsCount; bucket += 1) {
+    const start = bucket * per, end = Math.min(buffer.length, start + per);
+    let sum = 0, count = 0;
+    for (const channel of channels) {
+      for (let i = start; i < end; i += 1) {
+        const value = channel[i] || 0;
+        sum += value * value;
+        count += 1;
+      }
+    }
+    rms.push(count > 0 ? Math.sqrt(sum / count) : 0);
+  }
+  // One Hann-windowed FFT from the middle of the render, mapped to the analyser's default dB range.
+  const n = FFT_SIZE;
+  const real = new Float64Array(n), imag = new Float64Array(n);
+  const offset = Math.max(0, Math.floor((buffer.length - n) / 2));
+  const hann = new Float64Array(n);
+  for (let i = 0; i < n; i += 1) hann[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / Math.max(1, n - 1));
+  for (let i = 0; i < n; i += 1) {
+    const at = offset + i;
+    let value = 0;
+    if (at < buffer.length) {
+      for (const channel of channels) value += channel[at] || 0;
+      value /= Math.max(1, channels.length);
+    }
+    real[i] = value * hann[i];
+  }
+  for (let i = 1, j = 0; i < n; i += 1) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      const tr = real[i]; real[i] = real[j]; real[j] = tr;
+      const ti = imag[i]; imag[i] = imag[j]; imag[j] = ti;
+    }
+  }
+  for (let size = 2; size <= n; size <<= 1) {
+    const angle = -2 * Math.PI / size;
+    const wRe = Math.cos(angle), wIm = Math.sin(angle);
+    for (let start = 0; start < n; start += size) {
+      let curRe = 1, curIm = 0;
+      const half = size >> 1;
+      for (let k = 0; k < half; k += 1) {
+        const even = start + k, odd = even + half;
+        const tRe = real[odd] * curRe - imag[odd] * curIm;
+        const tIm = real[odd] * curIm + imag[odd] * curRe;
+        real[odd] = real[even] - tRe;
+        imag[odd] = imag[even] - tIm;
+        real[even] += tRe;
+        imag[even] += tIm;
+        const nextRe = curRe * wRe - curIm * wIm;
+        curIm = curRe * wIm + curIm * wRe;
+        curRe = nextRe;
+      }
+    }
+  }
+  const spectrum = [];
+  const MIN_DB = -100, MAX_DB = -30;
+  for (let bin = 0; bin < MAX_SPECTRUM && bin < n / 2; bin += 1) {
+    const magnitude = Math.hypot(real[bin], imag[bin]) / n;
+    const db = 20 * Math.log10(Math.max(magnitude, 1e-10));
+    spectrum.push(Math.max(0, Math.min(255, ((db - MIN_DB) / (MAX_DB - MIN_DB)) * 255)));
+  }
+  const mixerLayers = [];
+  for (const layer of layers.slice(0, 64)) {
+    mixerLayers.push({
+      id: String(layer.id || 'layer').slice(0, 64),
+      gain: typeof layer.gain === 'number' ? layer.gain : 0.5,
+      pan: typeof layer.pan === 'number' ? layer.pan : 0
+    });
+  }
+  return {
+    graph: { node_counts: counts, edges: edges },
+    spectrum: spectrum,
+    rms: rms,
+    mixer_state: { scenario_id: String(RECIPE.scenario_id || '').slice(0, 120), layers: mixerLayers },
+    sample_rate: ctx.sampleRate,
+    rendered_ms: Math.round(buffer.duration * 1000),
+    frames: buffer.length
+  };
+})()
+"#;
+
+/// Validate and bound the page's render report. A `null` value means the browser has no
+/// OfflineAudioContext; the page's named errors become typed errors with a remediation.
+fn parse_offline_render_reply(reply: &Value) -> Result<Value, ToolError> {
+    let value = reply.get("result").and_then(|result| result.get("value")).cloned().unwrap_or(Value::Null);
+    if value.is_null() {
+        return Err(ToolError::new(ErrorCode::FeatureMissing, "the browser has no OfflineAudioContext to render in")
+            .with_remediation("Use a Chromium-based browser; offline rendering needs OfflineAudioContext.")
+            .with_details(json!({"reason": "no_offline_audio_context"})));
+    }
+    if !value.is_object() {
+        return Err(
+            ToolError::new(ErrorCode::GarbledOutput, "the page's offline render report wasn't an object").with_remediation("Reload the page and try again.")
+        );
+    }
+    match value.get("error").and_then(Value::as_str) {
+        Some("no_offline_audio_context") => {
+            return Err(ToolError::new(ErrorCode::FeatureMissing, "the browser has no OfflineAudioContext to render in")
+                .with_remediation("Use a Chromium-based browser; offline rendering needs OfflineAudioContext.")
+                .with_details(json!({"reason": "no_offline_audio_context"})));
+        }
+        Some("render_failed") => {
+            let detail = value.get("message").and_then(Value::as_str).unwrap_or("the render failed");
+            return Err(ToolError::new(ErrorCode::ProgramFailed, format!("the offline render failed: {}", clip_text(detail, 300)))
+                .with_remediation("Check the recipe's frequencies, gains and filters, then try a shorter render."));
+        }
+        Some("layer_failed") => {
+            let detail = value.get("message").and_then(Value::as_str).unwrap_or("a layer could not be built");
+            let index = value.get("layer").and_then(Value::as_u64).unwrap_or(0);
+            return Err(ToolError::new(ErrorCode::ProgramFailed, format!("layer {index} could not be built: {}", clip_text(detail, 300)))
+                .with_remediation("Check the layer's waveform, frequency, gain and filter, then try again."));
+        }
+        Some(other) => {
+            return Err(ToolError::new(ErrorCode::GarbledOutput, format!("the page reported an unknown offline render error: {}", clip_text(other, 120)))
+                .with_remediation("Reload the page and try again; if it persists, the page may be overriding OfflineAudioContext."));
+        }
+        None => {}
+    }
+
+    let mut spectrum = number_list(&value, "spectrum")?;
+    let mut truncated = spectrum.len() > MAX_OFFLINE_SPECTRUM;
+    spectrum.truncate(MAX_OFFLINE_SPECTRUM);
+    let mut rms = number_list(&value, "rms")?;
+    truncated |= rms.len() > MAX_OFFLINE_RMS;
+    rms.truncate(MAX_OFFLINE_RMS);
+
+    let mut graph = value.get("graph").filter(|graph| graph.is_object()).cloned().unwrap_or_else(|| json!({"node_counts": {}, "edges": []}));
+    if let Some(edges) = graph.get_mut("edges").and_then(Value::as_array_mut)
+        && edges.len() > MAX_CAPTURE_EDGES
+    {
+        edges.truncate(MAX_CAPTURE_EDGES);
+        truncated = true;
+    }
+    if let Some(counts) = graph.get_mut("node_counts").and_then(Value::as_object_mut) {
+        while counts.len() > MAX_CAPTURE_KINDS {
+            let Some(kind) = counts.keys().next().cloned() else { break };
+            counts.remove(&kind);
+            truncated = true;
+        }
+    }
+
+    let mixer = value.get("mixer_state").filter(|state| state.is_object()).cloned().unwrap_or_else(|| json!({}));
+    let mixer_bytes = serde_json::to_string(&mixer).map(|text| text.len()).unwrap_or(0);
+    if mixer_bytes > MAX_MIXER_BYTES {
+        return Err(ToolError::new(ErrorCode::OverLimit, format!("the recipe's mixer state is {mixer_bytes} bytes; at most {MAX_MIXER_BYTES} are kept"))
+            .with_remediation("Use shorter layer names, or expose only the fields the comparison needs."));
+    }
+
+    let sample_rate = value.get("sample_rate").and_then(Value::as_u64).filter(|rate| (1..=384_000).contains(rate)).unwrap_or(48_000);
+    let rendered_ms = value.get("rendered_ms").and_then(Value::as_u64).unwrap_or(0);
+    Ok(json!({
+        "graph": graph,
+        "spectrum": spectrum,
+        "rms": rms,
+        "mixer_state": mixer,
+        "sample_rate": sample_rate,
+        "rendered_ms": rendered_ms,
+        "truncated": truncated,
+    }))
+}
+
+// ---------------------------------------------------------------------------------------------
 // web_walkthrough_record (active, consent-gated)
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1805,6 +3935,11 @@ pub struct WalkthroughParams {
     pub capture: WalkthroughCapture,
     /// Cookies and storage to start with (e.g. to explore the signed-in side of your own site).
     /// Every value given here is treated as a secret and redacted wherever it shows up.
+    /// To seed from a browser's CDP `Storage.getCookies` export (via a Page session, e.g.
+    /// `await page.cdp("Storage.getCookies")` — not `task.cdp`, which only takes Target/Browser
+    /// commands), filter that `cookies` array to the site's domain first (at most 200) and map
+    /// each entry per `StartingCookie`. Never log or store the exported `value`s: the run
+    /// reports only which names were set.
     #[serde(default)]
     pub storage: StartingStorage,
 }
@@ -2024,6 +4159,27 @@ fn capture_artifacts(client: &mut CdpClient, kinds: &[Artifact], dom_cap: usize,
     Value::Object(out)
 }
 
+/// Cookies and storage seeded before a walkthrough run.
+///
+/// An ego `page.cdp("Storage.getCookies")` result (`{"cookies": [...]}` of CDP
+/// `Network.Cookie`) becomes `{"cookies": [...], "local_storage": [], "session_storage": []}`
+/// by this exact mapping, entry by entry (names only in every log; values never logged):
+///
+/// | export field | `storage.cookies` field | rule |
+/// |---|---|---|
+/// | `name` | `name` | as-is |
+/// | `value` | `value` | as-is (a secret: redacted in every output) |
+/// | `domain` + `path` + `sourceScheme`/`secure` + `sourcePort` | `url` | `scheme://host[:port]path`: host is `domain` without a leading `.`; scheme is `https` when `sourceScheme` is `Secure` or `secure` is true, else `http`; a non-default `sourcePort` is kept, the default for the scheme is omitted; an empty `path` becomes `/` |
+/// | `httpOnly` | `http_only` | boolean as-is |
+/// | `secure` | `secure` | boolean as-is |
+/// | `sameSite` | `same_site` | `Strict`/`Lax`/`None` as-is; omit when absent |
+/// | `expires`, `session`, `priority`, `size` | — | dropped: the cookie becomes session-scoped for the run |
+///
+/// A domain cookie (`.example.com`) becomes a host cookie for `example.com` (the leading dot
+/// is stripped); `Network.setCookie` with a `url` sets host-only cookies. local/session storage
+/// is a separate CDP domain (`DOMStorage`), not part of `Storage.getCookies`, and is seeded
+/// through `local_storage`/`session_storage` instead. Filter the export to the site before
+/// seeding: `storage.cookies` caps at 200 entries.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct StartingStorage {
@@ -2035,15 +4191,20 @@ pub struct StartingStorage {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StartingCookie {
-    /// The http(s) URL the cookie belongs to.
+    /// The http(s) URL the cookie belongs to (from an export's `domain`, `path`, `sourceScheme`
+    /// or `secure`, and non-default `sourcePort`; see `StartingStorage`).
     pub url: String,
+    /// The cookie name (export `name`).
     pub name: String,
+    /// The cookie value (export `value`; a secret, redacted in every output).
     pub value: String,
+    /// HttpOnly flag (export `httpOnly`).
     #[serde(default)]
     pub http_only: bool,
+    /// Secure flag (export `secure`).
     #[serde(default)]
     pub secure: bool,
-    /// Strict, Lax or None.
+    /// Strict, Lax or None (export `sameSite`; omit when absent).
     #[serde(default)]
     pub same_site: Option<String>,
 }
@@ -2294,6 +4455,10 @@ fn web_walkthrough_record(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput
 
     let mut steps: Vec<Value> = Vec::new();
     let mut aborted: Option<String> = None;
+    // The evidence names the site the run actually examined (the last page a step left
+    // the tab on), not the tab it started on: `start_url` is kept in the result, but
+    // naming it as the website misreports every run that navigates elsewhere.
+    let mut last_url = start_url.clone();
     for (i, WalkthroughStep { step_id, action }) in p.actions.iter().enumerate() {
         if dl.expired() {
             aborted = Some("the overall deadline passed".into());
@@ -2310,7 +4475,9 @@ fn web_walkthrough_record(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput
         if let Ok(hist) = client.call("Page.getNavigationHistory", json!({}), None, &step_dl) {
             let idx = hist.get("currentIndex").and_then(Value::as_u64).unwrap_or(0) as usize;
             if let Some(entry) = hist.get("entries").and_then(Value::as_array).and_then(|a| a.get(idx)) {
-                step["url"] = json!(secrets.text(&web_common::sanitize_url(entry.get("url").and_then(Value::as_str).unwrap_or_default())));
+                let page_url = secrets.text(&web_common::sanitize_url(entry.get("url").and_then(Value::as_str).unwrap_or_default()));
+                last_url.clone_from(&page_url);
+                step["url"] = json!(page_url);
             }
         }
         if p.screenshot_each_step
@@ -2367,7 +4534,7 @@ fn web_walkthrough_record(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput
 
     let ok_steps = steps.iter().filter(|s| s["status"] == "ok").count();
     let summary =
-        format!("Ran {} of {} scripted step(s) on {start_url}{}.", ok_steps, p.actions.len(), aborted.as_ref().map(|a| format!(" ({a})")).unwrap_or_default());
+        format!("Ran {} of {} scripted step(s) on {last_url}{}.", ok_steps, p.actions.len(), aborted.as_ref().map(|a| format!(" ({a})")).unwrap_or_default());
     let result = json!({
         "browser": {"product": browser.product, "started_by": if browser.launched { "craft-anything" } else { "external" }, "cleanup": if browser.launched { "closed" } else { "disconnected" }},
         "start_url": start_url,
@@ -2383,7 +4550,7 @@ fn web_walkthrough_record(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput
         "secrets_hidden": p.hidden_values.len(),
         "secret_redactions": secrets.redactions,
     });
-    let mut b = EvidenceBuilder::new("web_walkthrough_record", Subject { kind: "website".into(), sha256: None, name: Some(start_url.clone()) }, browser_env(ctx.session.clean_room(), &browser))
+    let mut b = EvidenceBuilder::new("web_walkthrough_record", Subject { kind: "website".into(), sha256: None, name: Some(last_url.clone()) }, browser_env(ctx.session.clean_room(), &browser))
         .params(json!({"endpoint": browser.endpoint.origin, "launched": browser.launched, "action_count": p.actions.len(), "sensitive_value_declarations": p.hidden_values.len()}))
         .result(result)
         .summary(summary)
@@ -2396,7 +4563,7 @@ fn web_walkthrough_record(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput
             Limitation::new("values_not_kept", "Request/response bodies are reduced to outlines, cookies and auth headers are dropped, and declared secrets are redacted in every encoding.")
         })
         .coverage(Coverage::complete(p.actions.len() as u64))
-        .location(Location::new("url", start_url));
+        .location(Location::new("url", last_url));
     if p.hidden_values.iter().any(|s| !s.is_empty()) {
         b = b.limitation(Limitation::new("secrets_redacted", format!("{} occurrence(s) of declared values were redacted", secrets.redactions)));
     }

@@ -2784,6 +2784,28 @@ Owner: open · Status: in progress
       template only real calendar dates in API paths (#602–#605, by Afloat16)
 - [x] Preserve empty query pairs when matching older stand-in recordings, without treating raw
       query separators as pairs — claimed: Afloat16, branch `bugfix/r3.13-preserve-empty-query-pairs-20261103`
+- [ ] `web_audio_state_apply`: restore a captured mixer state (layer gains and pans) to a page,
+      the inverse of the phase-2 interaction trace (`web_audio_capture` records `mixer_envelope`
+      but nothing replays it yet).
+- [ ] See a page's whole audio graph from the first node: wrap the `AudioContext` constructor and
+      its node-creation methods from `Page.addScriptToEvaluateOnNewDocument`, before the page
+      builds its graph, so a context kept in module scope (e.g. Endel's) is captured and every
+      node it creates is recorded; the analyser is read from that context. A graph fully built
+      before the injection starts stays unrecoverable, and the capture must keep reporting the
+      empty graph rather than claiming coverage.
+- [ ] Persist `audio-fingerprint.json` beside the capture as the plan's storage shape requires:
+      `web_audio_fingerprint` returns a v1 fingerprint as evidence but writes no file.
+- [ ] Make the fingerprint's log-bin shape robust to the page analyser's FFT size: a live-identical
+      loopback rendition scored cosine 0.98 against the offline render with an 8192-point analyser,
+      but 0.52 with the 2048-point default (below the 0.85 acceptance bar).
+- [ ] Live-proof the attached Endel capture end to end: 30 s from the signed-in ego browser
+      while Focus plays — graph, spectrum, mixer snapshot, nothing secret in the evidence
+      (`web_audio_offline_render`, fingerprint and compare already prove live).
+- [ ] Live-proof the remaining Endel scenarios the same way; the fingerprint path is
+      scenario-agnostic, each scenario's mixer shape needs its own check.
+- [ ] A music-generation asset provider (sibling of the picture/3D providers) that builds an
+      audio recipe from a prompt; distinct from `web_audio_offline_render`, which renders a
+      given recipe.
 
 ---
 

@@ -27,7 +27,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "web_site_open",
             "Open a website",
-            "Load a web page (http/https) in a private browser owned by this session (fresh profile, no history or logins) at a chosen window size, wait for it to finish loading, and report its final address, title and size. Every browser tool then inspects this page unless given another endpoint. Runs the site's scripts, so it needs your approval.",
+            "Load a web page (http/https) in a private browser owned by this session (fresh profile, no history or logins) at a chosen window size, wait for it to finish loading, and report its final address, title and size. With browser \"attached\" and a loopback cdp_endpoint (Deep mode only), it uses a browser left running elsewhere instead and leaves it running. Every browser tool then inspects this page unless given another endpoint. Runs the site's scripts, so it needs your approval.",
             "Open a website in a private, hidden browser so it can be studied.",
             Toolset::Browser,
             Effects::EVIDENCE.union(Effects::EXECUTES_FOREIGN_CODE).union(Effects::ACCESSES_NETWORK).union(Effects::LAUNCHES_PROCESS),
@@ -60,7 +60,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "web_site_close",
             "Close the website",
-            "Close the private browser started by web_site_open and delete its temporary profile.",
+            "Close a private browser started by web_site_open (or forget an attached one, leaving it running) and delete its temporary profile.",
             "Close the hidden browser.",
             Toolset::Browser,
             Effects::MUTATES_SESSION.union(Effects::IDEMPOTENT),
@@ -80,6 +80,8 @@ pub struct SiteBrowser {
     pub url: Mutex<String>,
     /// What went wrong while the last page opened ([`page_health`]); web_site_capture records it.
     pub health: Mutex<Value>,
+    /// True when attached to a browser left running elsewhere (never started or closed here).
+    pub attached: bool,
     _owner: Mutex<Browser>,
 }
 
@@ -110,8 +112,24 @@ pub struct OpenParams {
     /// Run the browser without a window (default true).
     #[serde(default = "yes")]
     pub headless: bool,
+    /// Browser to use: "private" (default) starts a fresh private browser; "attached" uses a
+    /// browser already running with --remote-debugging-port at cdp_endpoint and leaves it
+    /// running (Deep mode only: it shows that browser's signed-in state; cookies and
+    /// storage are never read). Surfaced in the CLI flags (--browser/--cdp-endpoint), the
+    /// Experienced tool form (schema fields) and the MCP transport; the Beginner "Look at a
+    /// website" dialog never sets it and always opens private.
+    #[serde(default = "d_private")]
+    pub browser: String,
+    /// Loopback CDP endpoint for browser "attached", e.g. http://127.0.0.1:9222 (the browser
+    /// was started with --remote-debugging-port). Required with "attached", unused with "private".
+    #[serde(default)]
+    pub cdp_endpoint: Option<String>,
     #[serde(default = "d_timeout")]
     pub timeout_secs: u64,
+}
+
+fn d_private() -> String {
+    "private".to_string()
 }
 
 fn d_width() -> u32 {
@@ -151,23 +169,80 @@ fn web_site_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
     if !(320..=3840).contains(&p.width) || !(320..=4000).contains(&p.height) {
         return Err(ToolError::invalid("width must be 320..=3840 and height 320..=4000"));
     }
+    let attached = match p.browser.as_str() {
+        "private" => false,
+        "attached" => true,
+        other => {
+            return Err(ToolError::invalid(format!("browser {other:?} is not known")).with_remediation(
+                "Use \"private\" for a fresh browser, or \"attached\" with a loopback cdp_endpoint (e.g. a browser started with --remote-debugging-port).",
+            ));
+        }
+    };
+    let endpoint = if attached {
+        // Attaching uses a running browser's logins: Deep mode only, never Clean room.
+        if ctx.session.clean_room() {
+            return Err(crate::clean_room::refusal("web_site_open"));
+        }
+        let ep = p.cdp_endpoint.as_deref().map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
+            ToolError::invalid("browser \"attached\" needs a cdp_endpoint")
+                .with_remediation("Give a loopback CDP endpoint such as http://127.0.0.1:9222, from a browser started with --remote-debugging-port.")
+        })?;
+        Some(cdp::parse_endpoint(ep)?)
+    } else {
+        None
+    };
     let dl = deadline(ctx, p.timeout_secs)?;
-    let site = match live_site(ctx, &dl) {
-        Some(s) => s,
-        None => {
-            ctx.report(None, "Starting a private browser…");
-            let opts = LaunchOptions { allow_launch: true, headless: p.headless, no_sandbox: false, startup_secs: 30 };
-            let b = Browser::launch(ctx, &opts, &dl)?;
+    let site = if let Some(endpoint) = endpoint {
+        // Reuse the same attached browser; a different endpoint replaces it (nothing is closed).
+        if let Some(s) = live_site(ctx, &dl)
+            && s.attached
+            && s.endpoint == endpoint
+        {
+            s
+        } else {
+            ctx.report(None, "Attaching to the running browser…");
+            let opts = LaunchOptions { allow_launch: false, headless: p.headless, no_sandbox: false, startup_secs: 30 };
+            let b = Browser::resolve(ctx, Some(&endpoint.origin), &opts, &dl)?;
             let site = Arc::new(SiteBrowser {
                 endpoint: b.endpoint.clone(),
                 product: b.product.clone(),
                 version: b.version.clone(),
                 url: Mutex::new(String::new()),
                 health: Mutex::new(Value::Null),
+                attached: true,
                 _owner: Mutex::new(b),
             });
             ctx.session.ext.insert(site.clone());
             site
+        }
+    } else {
+        // A private open reuses only a private browser; an attached one is not its browser.
+        let reuse = match live_site(ctx, &dl) {
+            Some(s) if !s.attached => Some(s),
+            Some(_) => {
+                ctx.session.ext.remove::<SiteBrowser>();
+                None
+            }
+            None => None,
+        };
+        match reuse {
+            Some(s) => s,
+            None => {
+                ctx.report(None, "Starting a private browser…");
+                let opts = LaunchOptions { allow_launch: true, headless: p.headless, no_sandbox: false, startup_secs: 30 };
+                let b = Browser::launch(ctx, &opts, &dl)?;
+                let site = Arc::new(SiteBrowser {
+                    endpoint: b.endpoint.clone(),
+                    product: b.product.clone(),
+                    version: b.version.clone(),
+                    url: Mutex::new(String::new()),
+                    health: Mutex::new(Value::Null),
+                    attached: false,
+                    _owner: Mutex::new(b),
+                });
+                ctx.session.ext.insert(site.clone());
+                site
+            }
         }
     };
     ctx.report(None, format!("Loading {url}…"));
@@ -201,17 +276,32 @@ fn web_site_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
         (e, f) => format!("{opened} While loading: {e} error(s), {f} failed request(s)."),
     };
     let browser = site.handle();
+    let mut params = json!({"url": shown, "width": p.width, "height": p.height, "browser": p.browser});
+    if site.attached {
+        params["endpoint"] = json!(site.endpoint.origin);
+    }
+    let limitation = if site.attached {
+        Limitation::new(
+            "attached_browser",
+            format!(
+                "Attached to a running browser at {} that Craft Anything did not start and will not close; pages behind a login show their signed-in state. Cookies and storage were never read.",
+                site.endpoint.origin
+            ),
+        )
+    } else {
+        Limitation::new("private_profile", "A fresh private browser: pages behind a login show their signed-out state.")
+    };
     let ev = EvidenceBuilder::new(
         "web_site_open",
         Subject { kind: "website".into(), sha256: None, name: Some(shown.clone()) },
         browser_env(ctx.session.clean_room(), &browser),
     )
-    .params(json!({"url": shown, "width": p.width, "height": p.height}))
+    .params(params)
     .result(json!({"url": final_url, "title": title, "facts": facts, "health": health, "browser": site.product}))
     .summary(summary)
     .confidence(Confidence::Observed)
     .authority(Authority::OurRun)
-    .limitation(Limitation::new("private_profile", "A fresh private browser: pages behind a login show their signed-out state."))
+    .limitation(limitation)
     .coverage(Coverage::complete(1))
     .location(Location::new("url", shown))
     .build()?;
@@ -1192,6 +1282,80 @@ fn web_site_close(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Attached opens accept only a loopback endpoint and never fall back to launching a
+    /// private browser: bad endpoints and unreachable ports fail here, before any browser
+    /// is started (no real browser is needed for these errors).
+    #[test]
+    fn attached_open_validates_the_endpoint_without_launching() {
+        // Defaults preserve the private browser.
+        let p: OpenParams = parse_params(json!({"url": "https://example.com"})).unwrap();
+        assert_eq!(p.browser, "private");
+        assert_eq!(p.cdp_endpoint, None);
+        let p: OpenParams = parse_params(json!({"url": "https://example.com", "browser": "attached", "cdp_endpoint": "http://127.0.0.1:9222"})).unwrap();
+        assert_eq!(p.browser, "attached");
+        assert_eq!(p.cdp_endpoint.as_deref(), Some("http://127.0.0.1:9222"));
+
+        // Deep mode, finds no engine unless set: point chromium at an existing file so the
+        // tool's engine gate passes and the attached validation is what runs.
+        let dir = tempfile::tempdir().unwrap();
+        let browser = dir.path().join("browser");
+        std::fs::write(&browser, "").unwrap();
+        let mut session = crate::testing::session();
+        session.settings.engines.tools.chromium = Some(browser);
+        let e = crate::Engine::new(session);
+        let call = |params: Value| e.call("web_site_open", params, crate::CallOptions::new(Caller::Cli).with_consent(crate::Consent::Granted)).unwrap_err();
+        assert_eq!(call(json!({"url": "https://example.com", "browser": "ego"})).code, ErrorCode::BadInput);
+        assert_eq!(call(json!({"url": "https://example.com", "browser": "attached"})).code, ErrorCode::BadInput);
+        assert_eq!(call(json!({"url": "https://example.com", "browser": "attached", "cdp_endpoint": "http://localhost:9222"})).code, ErrorCode::BadSettings);
+        assert_eq!(call(json!({"url": "https://example.com", "browser": "attached", "cdp_endpoint": "http://192.168.1.50:9222"})).code, ErrorCode::BadSettings);
+        // Nothing answers on this loopback port: an engine problem, not a launch or a crash.
+        assert_eq!(call(json!({"url": "https://example.com", "browser": "attached", "cdp_endpoint": "http://127.0.0.1:1"})).code, ErrorCode::EngineMissing);
+    }
+
+    /// Attached opens in Clean room are refused as a feature, not a crash or a hang, and every
+    /// attached error says how to fix it in plain words. The clean-room engine points chromium at
+    /// an existing file only so the value checks (not the engine gate) are what run.
+    #[test]
+    fn attached_open_in_clean_room_is_refused_and_attached_errors_say_how_to_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let browser = dir.path().join("browser");
+        std::fs::write(&browser, "").unwrap();
+        let mut clean = crate::testing::session();
+        clean.settings.deep_mode = false;
+        clean.settings.engines.tools.chromium = Some(browser.clone());
+        let clean_engine = crate::Engine::new(clean);
+        let refused = clean_engine
+            .call(
+                "web_site_open",
+                json!({"url": "https://example.com", "browser": "attached", "cdp_endpoint": "http://127.0.0.1:9222"}),
+                crate::CallOptions::new(Caller::Cli).with_consent(crate::Consent::Granted),
+            )
+            .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::FeatureMissing, "{refused:?}");
+        assert!(crate::clean_room::is_refusal(&refused), "{refused:?}");
+        assert!(refused.remediation.as_deref().unwrap_or_default().contains("Deep mode"), "{refused:?}");
+
+        // Deep mode: every attached validation error carries a remediation and never launches.
+        let mut session = crate::testing::session();
+        session.settings.engines.tools.chromium = Some(browser);
+        let e = crate::Engine::new(session);
+        let call = |params: Value| e.call("web_site_open", params, crate::CallOptions::new(Caller::Cli).with_consent(crate::Consent::Granted)).unwrap_err();
+        for params in [
+            json!({"url": "https://example.com", "browser": "ego"}),
+            json!({"url": "https://example.com", "browser": "attached"}),
+            json!({"url": "https://example.com", "browser": "attached", "cdp_endpoint": "http://localhost:9222"}),
+            json!({"url": "https://example.com", "browser": "attached", "cdp_endpoint": "https://127.0.0.1:9222"}),
+            json!({"url": "https://example.com", "browser": "attached", "cdp_endpoint": "http://127.0.0.1:1"}),
+        ] {
+            let err = call(params);
+            assert!(err.remediation.as_deref().is_some_and(|r| !r.is_empty()), "{err:?} needs a fix");
+        }
+        // The unreachable loopback port is an engine problem with a start-the-browser fix.
+        let unreachable = call(json!({"url": "https://example.com", "browser": "attached", "cdp_endpoint": "http://127.0.0.1:1"}));
+        assert_eq!(unreachable.code, ErrorCode::EngineMissing);
+        assert!(unreachable.remediation.as_deref().unwrap_or_default().contains("remote-debugging-port"), "{unreachable:?}");
+    }
 
     #[test]
     fn a_click_is_described_by_what_changed() {

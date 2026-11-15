@@ -8,6 +8,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 fn call(e: &Engine, id: &str, p: Value) -> Result<Value, ToolError> {
     e.call(id, p, CallOptions::new(Caller::Mcp)).map(|o| o.to_json())
@@ -18,16 +19,52 @@ const SECRET: &str = "tok-SECRET-123";
 
 /// Start a fake CDP endpoint. Returns (endpoint url, a flag set true once a WS connection closed).
 fn fake_cdp() -> (String, Arc<AtomicBool>) {
+    fake_cdp_with_eval(Value::Null)
+}
+
+/// Start a fake CDP endpoint whose `Runtime.evaluate` answers with `value` (the remote object's
+/// `value`, e.g. an audio report or `null` for a page with no AudioContext).
+fn fake_cdp_with_eval(value: Value) -> (String, Arc<AtomicBool>) {
+    fake_cdp_with_eval_and_failing(value, &[])
+}
+
+/// As [`fake_cdp_with_eval`], but the browser refuses `failing` methods with a CDP error (what a
+/// browser without that domain does), so a tool's "unavailable" path can be exercised.
+fn fake_cdp_with_eval_and_failing(value: Value, failing: &[&str]) -> (String, Arc<AtomicBool>) {
+    fake_cdp_full(value, failing, None)
+}
+
+/// As [`fake_cdp_with_eval`], but the interaction-trace collector answers with `trace` (the raw
+/// sampler report), so a malformed or counted-drop trace can be exercised.
+fn fake_cdp_with_trace(value: Value, trace: Value) -> (String, Arc<AtomicBool>) {
+    fake_cdp_full(value, &[], Some(trace))
+}
+
+fn fake_cdp_full(value: Value, failing: &[&str], trace: Option<Value>) -> (String, Arc<AtomicBool>) {
+    fake_cdp_full_with_hanging(value, failing, trace, &[])
+}
+
+/// As [`fake_cdp_full`], but the browser accepts `hanging` methods and never answers them (what an
+/// unresponsive page or a wedged renderer does), so a step's own deadline can be exercised.
+fn fake_cdp_full_with_hanging(value: Value, failing: &[&str], trace: Option<Value>, hanging: &[&str]) -> (String, Arc<AtomicBool>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let url = format!("http://127.0.0.1:{port}");
     let ws_seen = Arc::new(AtomicBool::new(false));
     let ws_seen2 = ws_seen.clone();
+    let eval = Arc::new(value);
+    let failing: Arc<Vec<String>> = Arc::new(failing.iter().map(|method| (*method).to_string()).collect());
+    let hanging: Arc<Vec<String>> = Arc::new(hanging.iter().map(|method| (*method).to_string()).collect());
+    let trace = trace.map(Arc::new);
     std::thread::spawn(move || {
         for s in listener.incoming() {
             let Ok(stream) = s else { break };
             let seen = ws_seen2.clone();
-            std::thread::spawn(move || serve(stream, port, seen));
+            let eval = eval.clone();
+            let failing = failing.clone();
+            let hanging = hanging.clone();
+            let trace = trace.clone();
+            std::thread::spawn(move || serve(stream, port, seen, eval, failing, trace, hanging));
         }
     });
     (url, ws_seen)
@@ -59,7 +96,72 @@ fn http_json(stream: &mut TcpStream, body: &str) {
     let _ = stream.write_all(resp.as_bytes());
 }
 
-fn serve(mut stream: TcpStream, port: u16, ws_seen: Arc<AtomicBool>) {
+/// Start a fake CDP endpoint that answers discovery and the WebSocket upgrade but never replies to
+/// `hanging` methods, so a tool's call runs into its deadline (a wedged page, without a browser).
+fn fake_cdp_hanging_on(hanging: &[&str]) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("http://127.0.0.1:{port}");
+    let hanging: Arc<Vec<String>> = Arc::new(hanging.iter().map(|method| (*method).to_string()).collect());
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(stream) = s else { break };
+            let hanging = hanging.clone();
+            std::thread::spawn(move || serve_hanging(stream, port, hanging));
+        }
+    });
+    url
+}
+
+fn serve_hanging(mut stream: TcpStream, port: u16, hanging: Arc<Vec<String>>) {
+    let (request_line, headers) = read_headers(&mut stream);
+    let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+    if path.starts_with("/json/version") {
+        http_json(&mut stream, &json!({"Browser": "HeadlessChrome/120", "Protocol-Version": "1.3"}).to_string());
+        return;
+    }
+    if path.starts_with("/json/list") {
+        let list = json!([{
+            "id": "PAGE1",
+            "type": "page",
+            "title": "Offline",
+            "url": "about:blank",
+            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/page/PAGE1")
+        }]);
+        http_json(&mut stream, &list.to_string());
+        return;
+    }
+    if headers.iter().any(|(k, v)| k == "upgrade" && v.eq_ignore_ascii_case("websocket")) {
+        let key = headers.iter().find(|(k, _)| k == "sec-websocket-key").map(|(_, v)| v.clone()).unwrap_or_default();
+        let accept = ws_accept(&key);
+        let resp = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n");
+        let _ = stream.write_all(resp.as_bytes());
+        while let Some(msg) = ws_read(&mut stream) {
+            let req: Value = match serde_json::from_str(&msg) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let id = req.get("id").and_then(Value::as_u64).unwrap_or(0);
+            let method = req.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+            if hanging.iter().any(|refused| refused == &method) {
+                continue;
+            }
+            ws_write(&mut stream, &json!({"id": id, "result": {}}).to_string());
+        }
+        return;
+    }
+    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+}
+
+fn serve(
+    mut stream: TcpStream,
+    port: u16,
+    ws_seen: Arc<AtomicBool>,
+    eval: Arc<Value>,
+    failing: Arc<Vec<String>>,
+    trace: Option<Arc<Value>>,
+    hanging: Arc<Vec<String>>,
+) {
     let (request_line, headers) = read_headers(&mut stream);
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
     if path.starts_with("/json/version") {
@@ -87,7 +189,7 @@ fn serve(mut stream: TcpStream, port: u16, ws_seen: Arc<AtomicBool>) {
         let accept = ws_accept(&key);
         let resp = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n");
         let _ = stream.write_all(resp.as_bytes());
-        serve_ws(&mut stream);
+        serve_ws(&mut stream, &eval, &failing, trace.as_deref(), &hanging);
         ws_seen.store(true, Ordering::Relaxed);
         return;
     }
@@ -154,7 +256,7 @@ fn ws_write(stream: &mut TcpStream, text: &str) {
     let _ = stream.write_all(&frame);
 }
 
-fn serve_ws(stream: &mut TcpStream) {
+fn serve_ws(stream: &mut TcpStream, eval: &Value, failing: &[String], trace: Option<&Value>, hanging: &[String]) {
     let bundle = craft_anything_testkit::electron::WEBPACK_BUNDLE;
     while let Some(msg) = ws_read(stream) {
         let req: Value = match serde_json::from_str(&msg) {
@@ -163,6 +265,13 @@ fn serve_ws(stream: &mut TcpStream) {
         };
         let id = req.get("id").and_then(Value::as_u64).unwrap_or(0);
         let method = req.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+        if hanging.iter().any(|refused| refused == &method) {
+            continue;
+        }
+        if failing.iter().any(|refused| refused == &method) {
+            ws_write(stream, &json!({"id": id, "error": {"code": -32601, "message": format!("'{method}' wasn't found")}}).to_string());
+            continue;
+        }
         // Reply to the command.
         let result = match method.as_str() {
             "DOM.getDocument" => json!({"root": {"nodeId": 1, "nodeType": 9, "nodeName": "#document", "children": [
@@ -202,6 +311,30 @@ fn serve_ws(stream: &mut TcpStream) {
             "Accessibility.getFullAXTree" => json!({"nodes": [{"role": {"value": "button"}, "name": {"value": format!("Pay {SECRET}")}}]}),
             "DOMStorage.getDOMStorageItems" => json!({"entries": [["theme", "dark-VALUE"]]}),
             "Network.getCookies" => json!({"cookies": [{"name": "sid", "value": "cookie-VALUE"}]}),
+            // The audio capture's introspection script; the test decides what the page reports.
+            // The interaction-trace scripts are recognised by their markers: the tracer starts,
+            // the collector returns the two readings a 10 Hz poll would have taken (or whatever
+            // raw sampler report the test supplies).
+            "Runtime.evaluate" => {
+                let expression = req.pointer("/params/expression").and_then(Value::as_str).unwrap_or_default();
+                if expression.contains("__craftAnythingTraceStart") {
+                    json!({"result": {"value": {"started": true, "layers": 1}}})
+                } else if expression.contains("__craftAnythingTraceStop") {
+                    let value = trace.cloned().unwrap_or_else(|| {
+                        json!({
+                            "samples": [
+                                {"t_ms": 0, "layer_id": "pad", "gain": 0.0, "pan": 0.0},
+                                {"t_ms": 200, "layer_id": "pad", "gain": 1.0, "pan": 0.0}
+                            ],
+                            "truncated": false,
+                            "traced_ms": 200
+                        })
+                    });
+                    json!({"result": {"value": value}})
+                } else {
+                    json!({"result": {"value": eval.clone()}})
+                }
+            }
             _ => json!({}),
         };
         ws_write(stream, &json!({"id": id, "result": result}).to_string());
@@ -378,6 +511,69 @@ fn walkthrough_starts_with_given_storage_and_never_echoes_it() {
     assert!(run(json!({"session_storage": [{"origin": "ftp://x", "entries": {"a": "b"}}]})).unwrap_err().message.contains("http(s)"));
 }
 
+/// An ego-style `page.cdp("Storage.getCookies")` export maps to `storage.cookies` by the
+/// documented rules (see `StartingCookie`): camelCase `httpOnly`/`sameSite` become snake_case,
+/// `domain` + `path` + `sourceScheme`/`secure` + `sourcePort` synthesise `url` (the leading `.`
+/// is stripped, default ports are omitted, `path` is kept), `expires`/`session`/`priority`/`size`
+/// are dropped (the cookie becomes session-scoped for the run). Values are secrets: they are
+/// seeded but never echoed. The export must be filtered to the site first; `storage.cookies`
+/// caps at 200.
+#[test]
+fn exported_cookies_map_to_starting_storage_and_never_echo_their_values() {
+    use crate::tools::web_common::Secrets;
+    // Ego shape (CDP Network.Cookie), values are fake test data, never real secrets.
+    let exported = json!({
+        "cookies": [
+            {"name": "sid", "value": "cookie-VALUE-9", "domain": ".example.com", "path": "/app",
+             "expires": 1893456000.0, "httpOnly": true, "secure": true, "sameSite": "Lax",
+             "priority": "Medium", "session": false, "sourceScheme": "Secure", "sourcePort": 443},
+            {"name": "pref", "value": "pref-VALUE-3", "domain": "www.example.com", "path": "",
+             "httpOnly": false, "secure": false, "sourceScheme": "Unsecure", "sourcePort": 8080}
+        ]
+    });
+    // The documented mapping, applied here exactly as the StartingCookie docs describe.
+    let mapped = json!({
+        "cookies": [
+            {"url": "https://example.com/app", "name": "sid", "value": "cookie-VALUE-9", "http_only": true, "secure": true, "same_site": "Lax"},
+            {"url": "http://www.example.com:8080/", "name": "pref", "value": "pref-VALUE-3", "http_only": false, "secure": false}
+        ],
+        "local_storage": [],
+        "session_storage": []
+    });
+    // Secrets redaction covers the exported values in every encoding.
+    let values: Vec<String> = exported["cookies"].as_array().unwrap().iter().filter_map(|c| c["value"].as_str().map(str::to_string)).collect();
+    let mut secrets = Secrets::new(&values);
+    assert_eq!(secrets.text("sid=cookie-VALUE-9"), "sid=«redacted»");
+    assert!(!secrets.text(&mapped.to_string()).contains("cookie-VALUE-9"));
+
+    let (url, _) = fake_cdp();
+    let e = Engine::new(crate::testing::session());
+    let v = e
+        .call(
+            "web_walkthrough_record",
+            json!({"cdp_endpoint": url, "actions": [{"kind": "wait", "ms": 1}], "storage": mapped}),
+            CallOptions::new(Caller::Mcp).with_consent(crate::Consent::Granted),
+        )
+        .map(|o| o.to_json())
+        .unwrap();
+    let seeded = &v["result"]["starting_storage"];
+    assert_eq!(seeded["cookies_set"], json!(["sid", "pref"]));
+    assert_eq!(seeded["failed"], json!([]));
+    let text = v.to_string();
+    assert!(!text.contains("cookie-VALUE-9") && !text.contains("pref-VALUE-3"), "exported values are never echoed");
+    // The cap is enforced before anything is set.
+    let many = json!({"cookies": (0..201).map(|i| json!({"url": "https://app.test/", "name": format!("c{i}"), "value": "v"})).collect::<Vec<_>>()});
+    let err = e
+        .call(
+            "web_walkthrough_record",
+            json!({"cdp_endpoint": url, "actions": [{"kind": "wait", "ms": 1}], "storage": many}),
+            CallOptions::new(Caller::Mcp).with_consent(crate::Consent::Granted),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadInput);
+    assert!(err.message.contains("at most 200"), "{}", err.message);
+}
+
 #[test]
 fn walkthrough_records_artifacts_after_steps_and_at_the_end() {
     let (url, _) = fake_cdp();
@@ -423,6 +619,21 @@ fn walkthrough_keeps_network_from_every_step() {
     assert!(urls.iter().any(|u| u.contains("/api/items")), "the request from before the goto: {urls:?}");
     assert!(urls.iter().any(|u| u.contains("/after-goto")), "the request from the goto itself: {urls:?}");
     assert!(v["result"]["events"].is_null(), "no families asked for");
+}
+
+#[test]
+fn walkthrough_evidence_names_the_visited_site_not_the_starting_tab() {
+    // The picked tab starts on https://app.test/; the goto takes the page to /home.
+    // The evidence must name the site the run actually examined, not the tab it started on.
+    let (url, _) = fake_cdp();
+    let e = Engine::new(crate::testing::session());
+    let v = walkthrough(&e, json!({"cdp_endpoint": url, "actions": [{"kind": "goto", "url": "https://app.test/after-goto", "wait_ms": 50}]})).unwrap();
+    assert_eq!(v["result"]["start_url"], "https://app.test/", "the starting tab is still recorded");
+    let step_url = v["result"]["steps"][0]["url"].as_str().unwrap().to_string();
+    assert_ne!(step_url, "https://app.test/", "the run navigated");
+    assert_eq!(v["subject"]["name"].as_str().unwrap(), step_url, "the evidence names the visited site");
+    assert_eq!(v["locations"][0]["value"].as_str().unwrap(), step_url);
+    assert!(v["summary"].as_str().unwrap().contains(&step_url), "{}", v["summary"]);
 }
 
 #[test]
@@ -996,7 +1207,6 @@ fn same_origin_loopback_source_maps_are_fetched() {
     assert_eq!(seen.lock().unwrap().len(), 2);
 }
 
-/// #1811: a JSON response with no outline is said to be unread, not taken as a response with no
 /// body; when every JSON response got one there is nothing to say.
 #[test]
 fn a_missing_json_outline_is_said_in_the_evidence() {
@@ -1043,4 +1253,976 @@ fn a_recording_written_from_a_run_builds_a_stand_in() {
     let routes = out["result"]["routes"].as_array().unwrap();
     assert!(routes.iter().any(|r| r["template"] == "/v1/items/{id}"), "{}", out["result"]);
     assert_eq!(out["result"]["routes_total"], 1, "{}", out["result"]);
+}
+
+// ---- web_audio_fingerprint / web_audio_compare ----
+
+/// A web_audio_capture evidence record, in the shape that tool returns (no browser involved).
+fn capture_evidence() -> Value {
+    use craft_anything_evidence::{Authority, Confidence, EvidenceBuilder, Subject};
+    let ev = EvidenceBuilder::new(
+        "web_audio_capture",
+        Subject { kind: "audio-scene".into(), sha256: None, name: Some("focus".into()) },
+        crate::tools::web_common::cdp_env(false, Some("HeadlessChrome/120".into())),
+    )
+    .result(json!({
+        "graph": {"node_counts": {"gain": 2}, "edges": [{"from": "osc", "to": "gain", "kind": "audio"}]},
+        "spectrum": [1.0, 2.0, 3.0],
+        "rms": [0.1, 0.2],
+        "mixer_state": {"scenario_id": "focus"},
+        "mixer_envelope": [{"t_ms": 0, "layer_id": "pad", "gain": 0.2, "pan": 0.0}],
+        "network_outline": {"request_count": 0}
+    }))
+    .summary("x")
+    .confidence(Confidence::Observed)
+    .authority(Authority::OurRun)
+    .build()
+    .unwrap();
+    serde_json::to_value(ev).unwrap()
+}
+
+#[test]
+fn fingerprint_of_inline_capture_and_compare_roundtrip() {
+    let e = Engine::new(crate::testing::session());
+    let fp = call(
+        &e,
+        "web_audio_fingerprint",
+        json!({"spectrum": [1.0, 2.0, 3.0], "rms": [0.1, 0.2], "graph": {"node_counts": {"gain": 2}}, "mixer_state": {"scenario_id": "focus"}}),
+    )
+    .unwrap();
+    let f = &fp["result"]["fingerprint"];
+    assert_eq!(f["version"], 1);
+    assert_eq!(f["scenario_id"], "focus");
+    assert_eq!(f["log_bins"].as_array().map(Vec::len), Some(48));
+    let rms: Vec<f64> = f["rms_envelope"].as_array().unwrap().iter().filter_map(Value::as_f64).collect();
+    assert_eq!(rms.len(), 2);
+    assert!((rms[0] - 0.1).abs() < 1e-6 && (rms[1] - 0.2).abs() < 1e-6, "{rms:?}");
+    assert_eq!(f["graph_signature"]["node_counts"]["gain"], 2);
+
+    let cmp = call(&e, "web_audio_compare", json!({"before": fp.clone(), "after": fp, "log_bin_tolerance": 0.15})).unwrap();
+    assert_eq!(cmp["result"]["likeness_pass"], true, "{}", cmp["result"]);
+    assert!((cmp["result"]["log_bin_cosine"].as_f64().unwrap_or(0.0) - 1.0).abs() < 1e-9);
+    assert!((cmp["result"]["rms_correlation"].as_f64().unwrap_or(0.0) - 1.0).abs() < 1e-9);
+    assert_eq!(cmp["result"]["graph_diff"]["same"], true);
+    assert_eq!(cmp["result"]["envelope_distance"].as_f64(), Some(0.0));
+}
+
+#[test]
+fn fingerprint_consumes_a_capture_evidence_record() {
+    let e = Engine::new(crate::testing::session());
+    let capture = capture_evidence();
+    let capture_id = capture["id"].as_str().unwrap().to_string();
+    let fp = call(&e, "web_audio_fingerprint", json!({"capture": capture})).unwrap();
+    let f = &fp["result"]["fingerprint"];
+    assert_eq!(f["scenario_id"], "focus");
+    assert_eq!(f["graph_signature"]["node_counts"]["gain"], 2);
+    let rms: Vec<f64> = f["rms_envelope"].as_array().unwrap().iter().filter_map(Value::as_f64).collect();
+    assert_eq!(rms.len(), 2);
+    assert!((rms[0] - 0.1).abs() < 1e-6 && (rms[1] - 0.2).abs() < 1e-6, "{rms:?}");
+    assert_eq!(f["mixer_envelope"][0]["layer_id"], "pad");
+    assert_eq!(f["deep_mode"], true, "the capture was recorded in Deep mode");
+    assert_eq!(fp["links"], json!([capture_id.clone()]));
+    assert_eq!(fp["params"]["capture_evidence_id"], capture_id);
+}
+
+#[test]
+fn a_silent_capture_fails_likeness_with_a_low_energy_limitation() {
+    let e = Engine::new(crate::testing::session());
+    let silent = json!({"spectrum": [], "rms": [0.0, 0.0], "graph": {}, "mixer_state": {}});
+    let fp = call(&e, "web_audio_fingerprint", silent).unwrap();
+    let cmp = call(&e, "web_audio_compare", json!({"before": fp.clone(), "after": fp})).unwrap();
+    assert_eq!(cmp["result"]["likeness_pass"], false);
+    assert_eq!(cmp["result"]["log_bin_cosine"].as_f64(), Some(0.0), "zero energy is not a NaN");
+    assert_eq!(cmp["result"]["rms_correlation"].as_f64(), Some(0.0));
+    assert!(cmp["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "low_energy"), "{}", cmp["limitations"]);
+}
+
+#[test]
+fn mirrored_rms_envelopes_fail_likeness() {
+    let e = Engine::new(crate::testing::session());
+    let rising = json!({"spectrum": [1.0, 2.0, 3.0], "rms": [0.0, 0.25, 0.5, 0.75, 1.0]});
+    let falling = json!({"spectrum": [1.0, 2.0, 3.0], "rms": [1.0, 0.75, 0.5, 0.25, 0.0]});
+    let a = call(&e, "web_audio_fingerprint", rising).unwrap();
+    let b = call(&e, "web_audio_fingerprint", falling).unwrap();
+    let cmp = call(&e, "web_audio_compare", json!({"before": a, "after": b})).unwrap();
+    assert!((cmp["result"]["log_bin_cosine"].as_f64().unwrap_or(0.0) - 1.0).abs() < 1e-9, "the spectrum is identical");
+    assert!(cmp["result"]["rms_correlation"].as_f64().unwrap_or(1.0) < 0.8, "{}", cmp["result"]["rms_correlation"]);
+    assert_eq!(cmp["result"]["likeness_pass"], false, "a mirrored loudness shape is not the same scene");
+}
+
+#[test]
+fn mismatched_log_bin_counts_are_bad_input() {
+    let e = Engine::new(crate::testing::session());
+    let a = json!({"version": 1, "log_bins": [1.0, 2.0], "rms_envelope": [0.5]});
+    let b = json!({"version": 1, "log_bins": [1.0, 2.0, 3.0], "rms_envelope": [0.5]});
+    let err = call(&e, "web_audio_compare", json!({"before": a, "after": b})).unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadInput, "{}", err.message);
+    assert!(err.remediation.unwrap_or_default().contains("bins"), "{}", err.message);
+}
+
+#[test]
+fn oversized_or_unknown_fingerprints_are_typed_errors() {
+    let e = Engine::new(crate::testing::session());
+    let good = json!({"version": 1, "log_bins": [1.0, 2.0], "rms_envelope": [0.5]});
+    let oversized = json!({"version": 1, "log_bins": [1.0, 2.0], "rms_envelope": vec![0.1; 601]});
+    let err = call(&e, "web_audio_compare", json!({"before": good.clone(), "after": oversized})).unwrap_err();
+    assert_eq!(err.code, ErrorCode::OverLimit, "{}", err.message);
+
+    let mut future = good.clone();
+    future["version"] = json!(99);
+    let err = call(&e, "web_audio_compare", json!({"before": good.clone(), "after": future})).unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadInput, "{}", err.message);
+
+    let err = call(&e, "web_audio_compare", json!({"before": good.clone(), "after": good, "log_bin_tolerance": 1.5})).unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadInput, "{}", err.message);
+    assert!(err.message.contains("log_bin_tolerance"), "{}", err.message);
+}
+
+#[test]
+fn mismatched_envelope_lengths_still_compare() {
+    let e = Engine::new(crate::testing::session());
+    let envelope = |n: usize| -> Vec<Value> { (0..n).map(|i| json!({"t_ms": i * 10, "layer_id": "pad", "gain": i as f64 / n as f64, "pan": 0.0})).collect() };
+    let a = call(&e, "web_audio_fingerprint", json!({"spectrum": [1.0, 2.0], "rms": [0.5], "mixer_envelope": envelope(100)})).unwrap();
+    let b = call(&e, "web_audio_fingerprint", json!({"spectrum": [1.0, 2.0], "rms": [0.5], "mixer_envelope": envelope(98)})).unwrap();
+    let cmp = call(&e, "web_audio_compare", json!({"before": a, "after": b})).unwrap();
+    let distance = cmp["result"]["envelope_distance"].as_f64().unwrap_or(f64::NAN);
+    assert!(distance.is_finite() && distance < 0.02, "resampled distance {distance}");
+    assert!(cmp["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "envelope_resampled"), "{}", cmp["limitations"]);
+}
+
+#[test]
+fn flipped_slider_direction_fails_audio_compare() {
+    let e = Engine::new(crate::testing::session());
+    let trace = |rising: bool| -> Vec<Value> {
+        let (first, last) = if rising { (0.0, 1.0) } else { (1.0, 0.0) };
+        vec![json!({"t_ms": 0, "layer_id": "pad", "gain": first, "pan": 0.0}), json!({"t_ms": 1_000, "layer_id": "pad", "gain": last, "pan": 0.0})]
+    };
+    // The spectrum and loudness are identical on both sides; only the traced slider direction flips.
+    let before = call(
+        &e,
+        "web_audio_fingerprint",
+        json!({"spectrum": [1.0, 2.0, 3.0], "rms": [0.2, 0.4], "mixer_state": {"scenario_id": "focus"}, "mixer_envelope": trace(true)}),
+    )
+    .unwrap();
+    let after = call(
+        &e,
+        "web_audio_fingerprint",
+        json!({"spectrum": [1.0, 2.0, 3.0], "rms": [0.2, 0.4], "mixer_state": {"scenario_id": "focus"}, "mixer_envelope": trace(false)}),
+    )
+    .unwrap();
+    let cmp = call(&e, "web_audio_compare", json!({"before": before.clone(), "after": after})).unwrap();
+    assert!((cmp["result"]["log_bin_cosine"].as_f64().unwrap_or(0.0) - 1.0).abs() < 1e-9, "the spectra are identical");
+    assert!(cmp["result"]["envelope_distance"].as_f64().unwrap_or(0.0) > 0.5, "{}", cmp["result"]);
+    assert_eq!(cmp["result"]["likeness_pass"], false, "a flipped slider direction is not the same mix: {}", cmp["result"]);
+
+    // The same direction still compares as alike.
+    let same = call(&e, "web_audio_compare", json!({"before": before.clone(), "after": before})).unwrap();
+    assert_eq!(same["result"]["likeness_pass"], true, "{}", same["result"]);
+}
+
+#[test]
+fn graph_diff_reports_added_and_removed_nodes_and_edges() {
+    let e = Engine::new(crate::testing::session());
+    let fingerprint = |counts: Value, edges: Value| {
+        call(&e, "web_audio_fingerprint", json!({"spectrum": [1.0, 2.0], "rms": [0.5], "graph": {"node_counts": counts, "edges": edges}})).unwrap()
+    };
+    let before = fingerprint(json!({"gain": 2, "oscillator": 1}), json!([{"from": "osc", "to": "gain", "kind": "audio"}]));
+    let after = fingerprint(json!({"gain": 3}), json!([]));
+    let cmp = call(&e, "web_audio_compare", json!({"before": before, "after": after})).unwrap();
+    let diff = &cmp["result"]["graph_diff"];
+    assert_eq!(diff["same"], false, "{diff}");
+    assert_eq!(diff["added_nodes"]["gain"], 1, "{diff}");
+    assert_eq!(diff["removed_nodes"]["oscillator"], 1, "{diff}");
+    assert_eq!(diff["added_edges"], json!([]), "{diff}");
+    assert_eq!(diff["removed_edges"], json!([{"from": "osc", "to": "gain", "kind": "audio"}]), "{diff}");
+    assert_eq!(cmp["result"]["likeness_pass"], true, "the spectrum and loudness are unchanged");
+}
+
+#[test]
+fn unequal_rms_envelopes_are_resampled_with_a_limitation() {
+    let e = Engine::new(crate::testing::session());
+    let before = call(&e, "web_audio_fingerprint", json!({"spectrum": [1.0, 2.0], "rms": [0.2, 0.4, 0.6]})).unwrap();
+    let after = call(&e, "web_audio_fingerprint", json!({"spectrum": [1.0, 2.0], "rms": [0.2, 0.3, 0.4, 0.5, 0.6]})).unwrap();
+    let cmp = call(&e, "web_audio_compare", json!({"before": before, "after": after})).unwrap();
+    let correlation = cmp["result"]["rms_correlation"].as_f64().unwrap_or(f64::NAN);
+    assert!(correlation.is_finite() && correlation > 0.99, "interpolated correlation {correlation}");
+    assert_eq!(cmp["result"]["likeness_pass"], true);
+    assert!(cmp["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "rms_resampled"), "{}", cmp["limitations"]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// web_audio_capture (Deep-only, live audio graph)
+
+/// Call web_audio_capture with the consent a foreign-code tool needs.
+fn capture_call(e: &Engine, p: Value) -> Result<Value, ToolError> {
+    e.call("web_audio_capture", p, CallOptions::new(Caller::Mcp).with_consent(crate::Consent::Granted)).map(|o| o.to_json())
+}
+
+/// What the page's introspection script reports for a playing audio scene.
+fn audio_report() -> Value {
+    json!({
+        "graph": {"node_counts": {"gain": 2, "oscillator": 1}, "edges": [{"from": "oscillator", "to": "gain", "kind": "audio"}]},
+        "spectrum": [0.0, 12.0, 40.0, 255.0],
+        "rms": [0.12, 0.2, 0.18],
+        "mixer_state": {"scenario_id": "focus", "title": format!("Focus {SECRET}")},
+        "mixer_envelope": [],
+        "sample_rate": 48000,
+        "fft_size": 2048,
+        "graph_truncated": false
+    })
+}
+
+#[test]
+fn capture_without_audio_context_is_typed_error() {
+    // The page answers the introspection script with null: it has no AudioContext to listen to.
+    let (url, _) = fake_cdp();
+    let e = Engine::new(crate::testing::session());
+    let err = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000})).unwrap_err();
+    assert_eq!(err.code, ErrorCode::FeatureMissing, "{}", err.message);
+    // The remediation covers both reasons for a null reply: audio that hasn't started, and a
+    // playing page whose context is not reachable on window (seen live on Endel: no AudioContext
+    // among its 1267 window properties while it was Generating/Focus).
+    let remediation = err.remediation.as_deref().unwrap_or_default();
+    assert!(remediation.contains("no AudioContext"), "{remediation:?}");
+    assert!(remediation.contains("out of reach"), "{remediation:?}");
+    assert!(remediation.contains("__craftAnythingAudioContext"), "{remediation:?}");
+    // An analyser alone is not enough: findContext() returns null before findAnalyser() runs.
+    assert!(!remediation.contains("context or analyser"), "{remediation:?}");
+    assert!(remediation.contains("__craftAnythingAudioContexts"), "{remediation:?}");
+    assert!(remediation.contains("context must be reachable first"), "{remediation:?}");
+    assert!(remediation.contains("tells the capture which node to read"), "{remediation:?}");
+    assert_eq!(err.details.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("no_audio_graph"));
+}
+
+#[test]
+fn capture_without_analyser_is_typed_error() {
+    let (url, _) = fake_cdp_with_eval(json!({"error": "no_analyser", "graph": {"node_counts": {}, "edges": []}}));
+    let e = Engine::new(crate::testing::session());
+    let err = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000})).unwrap_err();
+    assert_eq!(err.code, ErrorCode::FeatureMissing, "{}", err.message);
+    assert!(err.message.contains("AnalyserNode"), "{}", err.message);
+    assert_eq!(err.details.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("no_analyser"));
+}
+
+#[test]
+fn capture_returns_graph_spectrum_and_mixer_state_redacted() {
+    let (url, _) = fake_cdp_with_eval(audio_report());
+    let e = Engine::new(crate::testing::session());
+    let v = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000, "hidden_values": [SECRET]})).unwrap();
+    let r = &v["result"];
+    assert_eq!(r["graph"]["node_counts"]["gain"], 2);
+    assert_eq!(r["graph"]["edges"][0]["from"], "oscillator");
+    assert_eq!(r["spectrum"].as_array().map(Vec::len), Some(4));
+    assert_eq!(r["rms"].as_array().map(Vec::len), Some(3));
+    assert_eq!(r["mixer_state"]["scenario_id"], "focus");
+    assert_eq!(r["mixer_envelope"], json!([]), "no interaction trace in the tracer bullet");
+    assert_eq!(r["sample_rate"], 48000);
+    assert_eq!(r["duration_ms"], 5000);
+    assert!(r["captured_at_ms"].as_u64().unwrap_or(0) > 0, "the capture is stamped");
+    assert!(r["secret_redactions"].as_u64().unwrap_or(0) >= 1, "{}", r["secret_redactions"]);
+    assert!(!v.to_string().contains(SECRET), "declared values never appear in the evidence");
+    assert_eq!(v["confidence"], "observed");
+    assert_eq!(v["environment"]["clean_room"], false);
+
+    // What it returns is exactly what web_audio_fingerprint consumes.
+    let fp = call(&e, "web_audio_fingerprint", json!({"capture": v.clone()})).unwrap();
+    assert_eq!(fp["result"]["fingerprint"]["scenario_id"], "focus");
+    assert_eq!(fp["result"]["fingerprint"]["deep_mode"], true, "the capture ran in Deep mode");
+    assert_eq!(fp["result"]["fingerprint"]["rms_envelope"].as_array().map(Vec::len), Some(3));
+}
+
+#[test]
+fn capture_refuses_durations_outside_its_window() {
+    let (url, _) = fake_cdp();
+    let e = Engine::new(crate::testing::session());
+    for duration in [0, 4_999, 120_001, 600_000] {
+        let err = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": duration})).unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadInput, "{duration}: {}", err.message);
+        assert!(err.message.contains("duration_ms"), "{duration}: {}", err.message);
+    }
+}
+
+#[test]
+fn capture_runs_only_in_deep_mode() {
+    let mut session = crate::testing::session();
+    session.settings.deep_mode = false;
+    let e = Engine::new(session);
+    let err = capture_call(&e, json!({"cdp_endpoint": "http://127.0.0.1:9", "duration_ms": 5000})).unwrap_err();
+    assert_eq!(err.code, ErrorCode::FeatureMissing, "{}", err.message);
+    assert_eq!(err.details.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("clean_room"));
+    assert!(err.remediation.as_deref().unwrap_or_default().contains("Deep mode"), "{:?}", err.remediation);
+}
+
+#[test]
+fn capture_counts_redactions_made_after_the_snapshot() {
+    // Nothing here is on the network: the secret lives only in the page's report, which is
+    // scrubbed after the result object is built. The count must include those redactions.
+    const REPORT_ONLY: &str = "report-only-SECRET-7";
+    let mut report = audio_report();
+    report["mixer_state"] = json!({"scenario_id": "focus", "label": REPORT_ONLY});
+    let mut counts = serde_json::Map::new();
+    counts.insert(format!("gain-{REPORT_ONLY}"), json!(1));
+    report["graph"]["node_counts"] = Value::Object(counts);
+    let (url, _) = fake_cdp_with_eval(report);
+    let e = Engine::new(crate::testing::session());
+    let v = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000, "hidden_values": [REPORT_ONLY]})).unwrap();
+    let redactions = v["result"]["secret_redactions"].as_u64().unwrap_or(0);
+    assert!(redactions >= 2, "the mixer and graph occurrences are counted, not only those redacted before the snapshot: {redactions}");
+    assert!(!v.to_string().contains(REPORT_ONLY), "the report-only secret never appears in the evidence");
+}
+
+#[test]
+fn capture_outlines_the_requests_it_saw_while_listening() {
+    let (url, _) = fake_cdp_with_eval(audio_report());
+    let e = Engine::new(crate::testing::session());
+    let v = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000, "hidden_values": [SECRET]})).unwrap();
+    let outline = &v["result"]["network_outline"];
+    assert_eq!(outline["request_count"], 1, "{outline}");
+    assert_eq!(outline["origins"]["https://app.test"], 1, "{outline}");
+    assert_eq!(outline["endpoints"][0]["method"], "GET", "{outline}");
+    assert_eq!(outline["endpoints"][0]["endpoint"], "https://app.test/api/items", "{outline}");
+    assert_eq!(outline["dropped"], 0, "{outline}");
+    assert_eq!(outline["unavailable"], json!([]), "{outline}");
+    assert!(!outline.to_string().contains(SECRET), "query values are dropped and the secret is redacted: {outline}");
+}
+
+#[test]
+fn capture_marks_the_network_outline_unavailable_when_the_browser_refuses_it() {
+    let (url, _) = fake_cdp_with_eval_and_failing(audio_report(), &["Network.enable"]);
+    let e = Engine::new(crate::testing::session());
+    let v = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000})).unwrap();
+    let outline = &v["result"]["network_outline"];
+    assert_eq!(outline["request_count"], 0, "{outline}");
+    assert_eq!(outline["dropped"], 0, "{outline}");
+    let unavailable = outline["unavailable"].as_array().cloned().unwrap_or_default();
+    assert!(
+        unavailable.iter().any(|reason| reason.as_str().unwrap_or_default().contains("Network.enable")),
+        "a refused enable is named, not silently reported as no requests: {outline}"
+    );
+}
+
+#[test]
+fn capture_records_an_interaction_traced_envelope() {
+    let (url, _) = fake_cdp_with_eval(audio_report());
+    let e = Engine::new(crate::testing::session());
+    let v = capture_call(
+        &e,
+        json!({
+            "cdp_endpoint": url,
+            "duration_ms": 5000,
+            "interaction_trace": true,
+            "steps": [
+                {"step_id": "raise the pad", "kind": "click", "selector": "#pad-slider"},
+                {"kind": "wait", "ms": 10}
+            ]
+        }),
+    )
+    .unwrap();
+    let r = &v["result"];
+    let envelope = r["mixer_envelope"].as_array().cloned().unwrap_or_default();
+    assert_eq!(envelope.len(), 2, "{r}");
+    assert_eq!(envelope[0]["layer_id"], "pad");
+    assert_eq!(envelope[0]["gain"], 0.0);
+    assert_eq!(envelope[1]["gain"], 1.0, "the slider move is in the traced envelope");
+    assert_eq!(r["interaction_trace"]["enabled"], true);
+    assert_eq!(r["interaction_trace"]["step_count"], 2);
+    assert_eq!(r["interaction_trace"]["aborted"], Value::Null);
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(!codes.contains(&"no_interaction_trace"), "a traced capture must not claim it has no trace: {codes:?}");
+    assert!(codes.contains(&"envelope_after_snapshot"), "the spectrum predates the steps and must say so: {codes:?}");
+
+    // The envelope reaches the fingerprint through the capture, and compares as the same mix.
+    let fp = call(&e, "web_audio_fingerprint", json!({"capture": v.clone()})).unwrap();
+    assert_eq!(fp["result"]["fingerprint"]["mixer_envelope"].as_array().map(Vec::len), Some(2), "{}", fp["result"]);
+    let cmp = call(&e, "web_audio_compare", json!({"before": fp.clone(), "after": fp})).unwrap();
+    assert_eq!(cmp["result"]["envelope_distance"].as_f64(), Some(0.0));
+    assert_eq!(cmp["result"]["likeness_pass"], true, "{}", cmp["result"]);
+}
+
+#[test]
+fn capture_without_a_trace_says_so() {
+    let (url, _) = fake_cdp_with_eval(audio_report());
+    let e = Engine::new(crate::testing::session());
+    let v = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000})).unwrap();
+    assert_eq!(v["result"]["mixer_envelope"], json!([]));
+    assert_eq!(v["result"]["interaction_trace"]["enabled"], false);
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(codes.contains(&"no_interaction_trace"), "{codes:?}");
+}
+
+#[test]
+fn capture_refuses_too_many_interaction_steps() {
+    let (url, _) = fake_cdp();
+    let e = Engine::new(crate::testing::session());
+    let steps = vec![json!({"kind": "wait", "ms": 1}); 201];
+    let err = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000, "interaction_trace": true, "steps": steps})).unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadInput, "{}", err.message);
+    assert!(err.message.contains("steps"), "{}", err.message);
+}
+
+#[test]
+fn a_slow_step_cannot_outlive_the_capture_deadline() {
+    // The page accepts a navigation and never answers it. The step must be cut down to the time
+    // `timeout_secs` left, not given a fresh 30 s allowance that outlives the whole capture.
+    let (url, _) = fake_cdp_full_with_hanging(audio_report(), &[], None, &["Page.navigate"]);
+    let e = Engine::new(crate::testing::session());
+    let steps: Vec<Value> = (0..5).map(|i| json!({"kind": "goto", "url": format!("https://app.test/step-{i}")})).collect();
+    let started = std::time::Instant::now();
+    let v = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000, "interaction_trace": true, "steps": steps, "timeout_secs": 1})).unwrap();
+    let elapsed = started.elapsed();
+    let trace = &v["result"]["interaction_trace"];
+    assert_eq!(trace["aborted"], "the overall deadline passed", "{trace}");
+    assert!(elapsed < Duration::from_secs(10), "the run stopped on its own deadline, not the 30 s step allowance: {elapsed:?}");
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(codes.contains(&"trace_aborted"), "{codes:?}");
+}
+
+#[test]
+fn capture_marks_an_over_cap_graph_and_spectrum_as_truncated() {
+    // The page reports more than the capture keeps: the evidence must say the data is bounded,
+    // not present the capped arrays as complete.
+    let mut report = audio_report();
+    report["spectrum"] = json!(vec![1.0; 5_000]);
+    report["graph"]["edges"] = Value::Array((0..2_001).map(|i| json!({"from": format!("n{i}"), "to": format!("m{i}"), "kind": "audio"})).collect());
+    let (url, _) = fake_cdp_with_eval(report);
+    let e = Engine::new(crate::testing::session());
+    let v = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000})).unwrap();
+    let r = &v["result"];
+    assert_eq!(r["graph_truncated"], true, "{r}");
+    assert_eq!(r["spectrum_truncated"], true, "{r}");
+    assert_eq!(r["spectrum"].as_array().map(Vec::len), Some(4_096));
+    assert_eq!(r["graph"]["edges"].as_array().map(Vec::len), Some(2_000));
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(codes.contains(&"bounded_capture"), "{codes:?}");
+}
+
+#[test]
+fn capture_script_marks_a_node_cap_as_truncated() {
+    // Shape guard: the recorder runs in the page, so assert the over-cap branch records the drop
+    // instead of returning the node as if it had been kept.
+    let script = super::audio_capture_script(5000);
+    assert!(script.contains("if (state.nodes.size < MAX_NODES) state.nodes.add(node);"), "the node cap is enforced");
+    assert!(script.contains("else state.truncated = true;"), "a refused node sets the truncated flag: the drop is recorded, never silent");
+}
+
+#[test]
+fn capture_names_params_the_trace_had_to_default() {
+    // A layer that only exposes .pan has no observed gain (the page never declared one), so the
+    // sampler records unity and counts the default instead of passing it off as measured.
+    let (url, _) = fake_cdp_with_trace(
+        audio_report(),
+        json!({
+            "samples": [{"t_ms": 0, "layer_id": "pad", "gain": 0.2, "pan": -0.4}],
+            "truncated": false,
+            "traced_ms": 200,
+            "defaulted_gain": 1,
+            "defaulted_pan": 2
+        }),
+    );
+    let e = Engine::new(crate::testing::session());
+    let v = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000, "interaction_trace": true})).unwrap();
+    assert_eq!(v["result"]["interaction_trace"]["defaulted_params"]["gain"], 1);
+    assert_eq!(v["result"]["interaction_trace"]["defaulted_params"]["pan"], 2);
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(codes.contains(&"envelope_defaulted_params"), "{codes:?}");
+}
+
+#[test]
+fn trace_sampler_pairs_a_gain_with_its_panner() {
+    // Cheap shape guard: without a JS runtime the sampler's pairing is asserted by its parts. The
+    // capture script records identity links (which node feeds which), and the sampler folds a
+    // panner into the gain that feeds it instead of inventing a second layer.
+    assert!(super::AUDIO_CAPTURE_SCRIPT.contains("state.links.push([this, destination])"), "the instrumentation must record node identity links");
+    assert!(super::AUDIO_CAPTURE_SCRIPT.contains("Array.isArray(state.links)"), "an older tracker state must gain the link list");
+    let script = super::AUDIO_TRACE_START_SCRIPT;
+    assert!(script.contains("absorbed.has(node)"), "a paired panner must not become its own layer");
+    assert!(script.contains("downstreamPan.get(node) || upstreamPan.get(node)"), "a gain must adopt an adjacent panner's pan in either chain direction");
+    assert!(script.contains("defaulted_gain") && script.contains("defaulted_pan"), "fabricated defaults must be counted");
+}
+
+#[test]
+fn capture_counts_unreadable_trace_rows_instead_of_dropping_the_trace() {
+    let (url, _) = fake_cdp_with_trace(
+        audio_report(),
+        json!({
+            "samples": [
+                {"t_ms": 0, "layer_id": "pad", "gain": 0.0, "pan": 0.0},
+                {"t_ms": "soon", "layer_id": "pad", "gain": 1.0, "pan": 0.0},
+                {"layer_id": "pad", "gain": 0.5}
+            ],
+            "truncated": false,
+            "traced_ms": 200
+        }),
+    );
+    let e = Engine::new(crate::testing::session());
+    let v = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000, "interaction_trace": true})).unwrap();
+    assert_eq!(v["result"]["mixer_envelope"].as_array().map(Vec::len), Some(1), "the readable row survives: {}", v["result"]);
+    assert_eq!(v["result"]["interaction_trace"]["dropped"], 2);
+    assert_eq!(v["result"]["interaction_trace"]["truncated"], true, "dropped rows are disclosed as a bounded trace");
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(codes.contains(&"envelope_rows_dropped"), "{codes:?}");
+}
+
+#[test]
+fn capture_reports_an_unreadable_trace_instead_of_an_empty_one() {
+    let (url, _) = fake_cdp_with_trace(audio_report(), json!({"samples": "not a list", "traced_ms": 200}));
+    let e = Engine::new(crate::testing::session());
+    let v = capture_call(&e, json!({"cdp_endpoint": url, "duration_ms": 5000, "interaction_trace": true})).unwrap();
+    assert_eq!(v["result"]["mixer_envelope"].as_array().map(Vec::len), Some(0));
+    let aborted = v["result"]["interaction_trace"]["aborted"].as_str().unwrap_or_default();
+    assert!(aborted.contains("unreadable"), "the reason must name the unreadable report: {aborted}");
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(codes.contains(&"trace_unreadable"), "{codes:?}");
+}
+
+#[test]
+fn trace_rows_keep_readable_rows_and_count_the_rest() {
+    let rows = super::parse_trace_rows(json!([
+        {"t_ms": 0, "layer_id": "pad", "gain": 0.0, "pan": 0.0},
+        {"t_ms": 1, "layer_id": "pad", "gain": 1.0, "pan": 0.0},
+        {"t_ms": 2, "layer_id": "pad", "gain": 0.5}
+    ]));
+    assert_eq!(rows.envelope.len(), 2, "the readable rows survive");
+    assert_eq!(rows.dropped, 1, "the incomplete row is counted, not silently swallowed");
+    assert!(!rows.unreadable);
+
+    let rows = super::parse_trace_rows(Value::Null);
+    assert!(rows.unreadable, "a missing report is named, not treated as an empty trace");
+    assert!(rows.envelope.is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// web_audio_offline_render (Deep-only, headless OfflineAudioContext)
+
+/// Call web_audio_offline_render with the consent a foreign-code tool needs.
+fn offline_call(e: &Engine, p: Value) -> Result<Value, ToolError> {
+    e.call("web_audio_offline_render", p, CallOptions::new(Caller::Mcp).with_consent(crate::Consent::Granted)).map(|o| o.to_json())
+}
+
+/// What the offline recipe's page reports for a finished render (the script's own shape).
+fn offline_report() -> Value {
+    json!({
+        "graph": {
+            "node_counts": {"oscillator": 2, "biquad_filter": 1, "gain": 2, "analyser": 1, "audio_destination": 1},
+            "edges": [
+                {"from": "oscillator", "to": "biquad_filter", "kind": "audio"},
+                {"from": "biquad_filter", "to": "gain", "kind": "audio"},
+                {"from": "gain", "to": "analyser", "kind": "audio"},
+                {"from": "analyser", "to": "audio_destination", "kind": "audio"}
+            ]
+        },
+        "spectrum": [0.0, 12.0, 40.0, 120.0, 255.0, 90.0],
+        "rms": [0.12, 0.2, 0.18],
+        "mixer_state": {"scenario_id": "focus", "layers": [{"id": "pad", "gain": 0.4, "pan": 0.0}]},
+        "sample_rate": 48000,
+        "rendered_ms": 30000,
+        "frames": 1440000
+    })
+}
+
+#[test]
+fn offline_render_timeout_is_typed_error() {
+    // The page never answers Runtime.evaluate: the call runs into its own deadline.
+    let url = fake_cdp_hanging_on(&["Runtime.evaluate"]);
+    let e = Engine::new(crate::testing::session());
+    let err = offline_call(&e, json!({"cdp_endpoint": url, "recipe": {"version": 1, "layers": []}, "duration_ms": 30000, "timeout_secs": 2})).unwrap_err();
+    assert_eq!(err.code, ErrorCode::TimedOut, "{}", err.message);
+}
+
+#[test]
+fn offline_render_records_a_truncated_spectrum_and_rms() {
+    // The page returns more than the render keeps: the evidence must say the result is bounded
+    // rather than present the capped arrays as the whole render.
+    let mut report = offline_report();
+    report["spectrum"] = json!(vec![1.0; 5_000]);
+    report["rms"] = json!(vec![0.1; 700]);
+    let (url, _) = fake_cdp_with_eval(report);
+    let e = Engine::new(crate::testing::session());
+    let v = offline_call(
+        &e,
+        json!({
+            "cdp_endpoint": url,
+            "recipe": {"version": 1, "layers": [{"id": "pad", "kind": "oscillator", "wave": "sine", "frequency": 220.0, "gain": 0.4}]},
+            "duration_ms": 30000
+        }),
+    )
+    .unwrap();
+    let r = &v["result"];
+    assert_eq!(r["truncated"], true, "{r}");
+    assert_eq!(r["spectrum_values"], 4_096, "{r}");
+    assert_eq!(r["rms_values"], 600, "{r}");
+    assert_eq!(r["fingerprint"]["rms_envelope"].as_array().map(Vec::len), Some(600));
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(codes.contains(&"bounded_render"), "{codes:?}");
+}
+
+#[test]
+fn offline_render_returns_a_fingerprint_web_audio_compare_accepts() {
+    let (url, _) = fake_cdp_with_eval(offline_report());
+    let e = Engine::new(crate::testing::session());
+    let v = offline_call(
+        &e,
+        json!({
+            "cdp_endpoint": url,
+            "recipe": {"version": 1, "scenario_id": "focus", "layers": [
+                {"id": "pad", "kind": "oscillator", "wave": "sine", "frequency": 220.0, "gain": 0.4},
+                {"id": "bass", "kind": "oscillator", "wave": "triangle", "frequency": 110.0, "gain": 0.2,
+                 "filter": {"kind": "lowpass", "frequency": 800.0, "q": 0.7}}
+            ]},
+            "duration_ms": 30000
+        }),
+    )
+    .unwrap();
+    let r = &v["result"];
+    assert_eq!(r["rendered_ms"], 30000);
+    assert_eq!(r["fingerprint"]["scenario_id"], "focus");
+    assert_eq!(r["fingerprint"]["version"], 1);
+    assert_eq!(r["fingerprint"]["deep_mode"], true, "offline rendering is Deep-only");
+    assert_eq!(r["fingerprint"]["log_bins"].as_array().map(Vec::len), Some(48));
+    assert_eq!(r["fingerprint"]["rms_envelope"].as_array().map(Vec::len), Some(3));
+    assert_eq!(r["fingerprint"]["graph_signature"]["node_counts"]["biquad_filter"], 1);
+    assert_eq!(v["confidence"], "observed");
+
+    // The output shape is exactly what web_audio_compare accepts as `after`.
+    let cmp = call(&e, "web_audio_compare", json!({"before": &r["fingerprint"], "after": v.clone()})).unwrap();
+    assert_eq!(cmp["result"]["likeness_pass"], true, "{}", cmp["result"]);
+}
+
+#[test]
+fn live_capture_and_offline_render_graphs_do_not_differ_on_the_destination() {
+    // A live capture names AudioDestinationNode "audio_destination": its connect wrapper records
+    // the node on the other end of every connection. The offline rebuild must count the same node
+    // kind, or every live-vs-render comparison reports a graph difference it invented.
+    let (url, _) = fake_cdp_with_eval(offline_report());
+    let e = Engine::new(crate::testing::session());
+    let rendered = offline_call(
+        &e,
+        json!({
+            "cdp_endpoint": url,
+            "recipe": {"version": 1, "scenario_id": "focus", "layers": [
+                {"id": "pad", "kind": "oscillator", "wave": "sine", "frequency": 220.0, "gain": 0.4},
+                {"id": "bass", "kind": "oscillator", "wave": "triangle", "frequency": 110.0, "gain": 0.2,
+                 "filter": {"kind": "lowpass", "frequency": 800.0, "q": 0.7}}
+            ]},
+            "duration_ms": 30000
+        }),
+    )
+    .unwrap();
+    let live = call(
+        &e,
+        "web_audio_fingerprint",
+        json!({
+            "spectrum": [0.0, 12.0, 40.0, 120.0, 255.0, 90.0],
+            "rms": [0.12, 0.2, 0.18],
+            "graph": {
+                "node_counts": {"oscillator": 2, "biquad_filter": 1, "gain": 2, "analyser": 1, "audio_destination": 1},
+                "edges": [
+                    {"from": "oscillator", "to": "biquad_filter", "kind": "audio"},
+                    {"from": "biquad_filter", "to": "gain", "kind": "audio"},
+                    {"from": "gain", "to": "analyser", "kind": "audio"},
+                    {"from": "analyser", "to": "audio_destination", "kind": "audio"}
+                ]
+            },
+            "mixer_state": {"scenario_id": "focus"}
+        }),
+    )
+    .unwrap();
+    let cmp = call(&e, "web_audio_compare", json!({"before": live, "after": rendered})).unwrap();
+    let diff = &cmp["result"]["graph_diff"];
+    assert_eq!(diff["same"], true, "the only difference would be an invented destination: {diff}");
+    assert_eq!(diff["added_nodes"], json!({}), "{diff}");
+    assert_eq!(diff["removed_nodes"], json!({}), "{diff}");
+    assert_eq!(cmp["result"]["likeness_pass"], true, "{}", cmp["result"]);
+}
+
+#[test]
+fn offline_render_script_counts_the_same_node_kinds_as_a_live_capture() {
+    // Cheap shape guard, not an execution: the script only runs for real in Task 6's live browser
+    // run. A live capture derives node kinds in AUDIO_CAPTURE_SCRIPT's kindOf() by dropping the
+    // "Node" suffix and camel-casing to snake_case, which yields these names:
+    assert!(super::AUDIO_CAPTURE_SCRIPT.contains("replace(/Node$/, '')"));
+    assert!(super::AUDIO_CAPTURE_SCRIPT.contains("replace(/([a-z0-9])([A-Z])/g, '$1_$2')"));
+    for (constructor, kind) in [
+        ("OscillatorNode", "oscillator"),
+        ("BiquadFilterNode", "biquad_filter"),
+        ("GainNode", "gain"),
+        ("StereoPannerNode", "stereo_panner"),
+        ("AnalyserNode", "analyser"),
+        ("AudioDestinationNode", "audio_destination"),
+    ] {
+        assert!(
+            super::OFFLINE_RENDER_SCRIPT.contains(&format!("add('{kind}')")),
+            "the offline script never counts {kind} (a live capture names {constructor} that way)"
+        );
+    }
+    assert!(super::OFFLINE_RENDER_SCRIPT.contains("link('analyser', 'audio_destination')"), "the destination edge must be recorded too");
+}
+
+#[test]
+fn offline_render_script_never_shadows_global_window() {
+    // Cheap shape guard, not an execution: the fake CDP used by the other offline tests never
+    // runs this script, so a live-only breakage (like the Hann-window `const window` that put
+    // `window` in the temporal dead zone and broke every real render) passes those tests.
+    // Declare nothing named `window` anywhere in the script function, so `window.OfflineAudioContext`
+    // resolves to the global instead of throwing ReferenceError before the first line.
+    let script = super::OFFLINE_RENDER_SCRIPT;
+    for declaration in ["const window", "let window", "var window", "function window", "const window=", "let window="] {
+        assert!(!script.contains(declaration), "the offline script must not shadow the global `window` (found `{declaration}`); that breaks every real render");
+    }
+    assert!(script.contains("window.OfflineAudioContext"), "the script must read the global window");
+}
+
+#[test]
+fn offline_render_schedules_layer_envelopes_and_fingerprints_them() {
+    let (url, _) = fake_cdp_with_eval(offline_report());
+    let e = Engine::new(crate::testing::session());
+    let recipe = json!({
+        "version": 1,
+        "scenario_id": "focus",
+        "layers": [{
+            "id": "pad",
+            "kind": "oscillator",
+            "wave": "sine",
+            "frequency": 220.0,
+            "gain": 0.4,
+            "envelope": [
+                {"t_ms": 0, "gain": 0.0, "pan": 0.0},
+                {"t_ms": 2000, "gain": 1.0, "pan": -0.5}
+            ]
+        }]
+    });
+    let v = offline_call(&e, json!({"cdp_endpoint": url, "recipe": recipe.clone(), "duration_ms": 30000})).unwrap();
+    let envelope = v["result"]["fingerprint"]["mixer_envelope"].as_array().cloned().unwrap_or_default();
+    // The declared 0→2000 ms trajectory is resampled to the even 100 ms grid the curve is
+    // scheduled on, and the fingerprint records exactly those grid times.
+    assert_eq!(envelope.len(), 21, "{}", v["result"]);
+    assert_eq!(envelope[0]["layer_id"], "pad");
+    assert_eq!(envelope[0]["t_ms"], 0);
+    assert_eq!(envelope[0]["gain"], 0.0);
+    assert_eq!(envelope[20]["t_ms"], 2000);
+    assert!((envelope[20]["gain"].as_f64().unwrap_or(0.0) - 1.0).abs() < 1e-6);
+    assert!((envelope[20]["pan"].as_f64().unwrap_or(0.0) + 0.5).abs() < 1e-6);
+    let times: Vec<u64> = envelope.iter().filter_map(|point| point["t_ms"].as_u64()).collect();
+    assert_eq!(times, (0..=20).map(|index| index * 100).collect::<Vec<u64>>(), "the recorded times are the scheduled grid");
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(!codes.contains(&"no_interaction_trace"), "a recipe with envelopes is not untraced: {codes:?}");
+    assert!(codes.contains(&"envelope_resampled"), "the grid must be disclosed: {codes:?}");
+
+    // The generated page script schedules the curve before startRendering(), for gain and pan.
+    let parsed: super::OfflineRecipe = serde_json::from_value(recipe).unwrap();
+    let plan = super::offline_recipe_plan(&parsed, 30_000).unwrap();
+    assert_eq!(plan["layers"][0]["envelope"].as_array().map(Vec::len), Some(21), "{plan}");
+    let planned = plan["layers"][0]["envelope"].as_array().cloned().unwrap_or_default();
+    let planned_times: Vec<u64> = planned.iter().filter_map(|point| point["t_ms"].as_u64()).collect();
+    assert_eq!(planned_times, times, "the fingerprint records the times the script schedules");
+    for (point, recorded) in planned.iter().zip(envelope.iter()) {
+        // The fingerprint stores f32 readings, so compare within float noise of the scheduled f64.
+        let near = |planned: &Value, recorded: &Value| (planned.as_f64().unwrap_or(f64::NAN) - recorded.as_f64().unwrap_or(f64::NAN)).abs() < 1e-6;
+        assert!(near(&point["gain"], &recorded["gain"]), "the fingerprint records the gain the script schedules: {} vs {}", point["gain"], recorded["gain"]);
+        assert!(near(&point["pan"], &recorded["pan"]), "the fingerprint records the pan the script schedules: {} vs {}", point["pan"], recorded["pan"]);
+    }
+    let script = super::offline_render_script(&plan, 30_000, 48_000).unwrap();
+    assert!(script.contains("setValueCurveAtTime"), "the curve must be scheduled");
+    assert!(script.contains("gain.gain.setValueCurveAtTime"), "the gain trajectory must be scheduled");
+    assert!(script.contains("panner.pan.setValueCurveAtTime"), "a pan trajectory needs a panner, even when the base pan is 0");
+    let schedule = script.find("setValueCurveAtTime").unwrap_or(usize::MAX);
+    let render = script.find("startRendering").unwrap_or(0);
+    assert!(schedule < render, "curves are scheduled before the render starts");
+
+    // A flipped envelope fails the likeness verdict against a rising reference.
+    let rising = v["result"]["fingerprint"].clone();
+    let falling = call(
+        &e,
+        "web_audio_fingerprint",
+        json!({
+            "spectrum": [0.0, 12.0, 40.0, 120.0, 255.0, 90.0],
+            "rms": [0.12, 0.2, 0.18],
+            "graph": {"node_counts": {}, "edges": []},
+            "mixer_state": {"scenario_id": "focus"},
+            "mixer_envelope": [
+                {"t_ms": 0, "layer_id": "pad", "gain": 1.0, "pan": -0.5},
+                {"t_ms": 2000, "layer_id": "pad", "gain": 0.0, "pan": 0.0}
+            ]
+        }),
+    )
+    .unwrap();
+    let cmp = call(&e, "web_audio_compare", json!({"before": rising.clone(), "after": falling})).unwrap();
+    assert_eq!(cmp["result"]["likeness_pass"], false, "{}", cmp["result"]);
+    let same = call(&e, "web_audio_compare", json!({"before": rising.clone(), "after": rising})).unwrap();
+    assert_eq!(same["result"]["likeness_pass"], true, "{}", same["result"]);
+}
+
+#[test]
+fn offline_envelope_is_a_uniform_grid_of_the_declared_trajectory() {
+    // The declared breakpoints (350 ms peak) are resampled onto the even grid the curve is
+    // actually scheduled on (5 points, 350/4 = 87.5 ms apart), so a mid-trajectory change is
+    // neither moved to the end nor recorded at a time the render never played.
+    let (url, _) = fake_cdp_with_eval(offline_report());
+    let e = Engine::new(crate::testing::session());
+    let recipe = json!({
+        "version": 1,
+        "layers": [{
+            "id": "pad",
+            "kind": "oscillator",
+            "wave": "sine",
+            "envelope": [
+                {"t_ms": 0, "gain": 0.0, "pan": 0.0},
+                {"t_ms": 350, "gain": 1.0, "pan": -0.5},
+                {"t_ms": 1000, "gain": 0.5, "pan": 0.25}
+            ]
+        }]
+    });
+    let v = offline_call(&e, json!({"cdp_endpoint": url, "recipe": recipe, "duration_ms": 3000})).unwrap();
+    let envelope = v["result"]["fingerprint"]["mixer_envelope"].as_array().cloned().unwrap_or_default();
+    let times: Vec<u64> = envelope.iter().filter_map(|point| point["t_ms"].as_u64()).collect();
+    assert_eq!(times, (0..=10).map(|index| index * 100).collect::<Vec<u64>>(), "{}", v["result"]);
+    let gain_at = |at: u64| envelope.iter().find(|point| point["t_ms"].as_u64() == Some(at)).and_then(|point| point["gain"].as_f64()).unwrap_or(f64::NAN);
+    assert!((gain_at(300) - 6.0 / 7.0).abs() < 1e-4, "300 ms is 6/7 of the way to the 350 ms peak: {}", gain_at(300));
+    assert!((gain_at(400) - (1.0 - 0.5 * 50.0 / 650.0)).abs() < 1e-4, "400 ms is just past the peak: {}", gain_at(400));
+    assert!((gain_at(1000) - 0.5).abs() < 1e-6, "the last declared point is the last scheduled point: {}", gain_at(1000));
+}
+
+#[test]
+fn offline_render_fits_long_envelopes_on_many_layers_within_the_fingerprint_budget() {
+    // 5 layers × 120 s at the 100 ms target is 5×1201 readings, more than the fingerprint keeps
+    // (6000). A legal render must not be refused: the layer share adapts its grid instead.
+    let (url, _) = fake_cdp_with_eval(offline_report());
+    let e = Engine::new(crate::testing::session());
+    let layers: Vec<Value> = (0..5)
+        .map(|index| {
+            json!({
+                "id": format!("layer_{index}"),
+                "kind": "oscillator",
+                "wave": "sine",
+                "envelope": [
+                    {"t_ms": 0, "gain": 0.0, "pan": 0.0},
+                    {"t_ms": 120_000, "gain": 0.5, "pan": 0.0}
+                ]
+            })
+        })
+        .collect();
+    let v = offline_call(&e, json!({"cdp_endpoint": url, "recipe": {"version": 1, "layers": layers}, "duration_ms": 120_000})).unwrap();
+    let envelope = v["result"]["fingerprint"]["mixer_envelope"].as_array().cloned().unwrap_or_default();
+    assert_eq!(envelope.len(), 6000, "the five layers share the fingerprint's 6000 readings: {}", v["result"]);
+    for index in 0..5 {
+        let layer = format!("layer_{index}");
+        let times: Vec<u64> = envelope.iter().filter(|point| point["layer_id"] == layer).filter_map(|point| point["t_ms"].as_u64()).collect();
+        assert_eq!(times.len(), 1200, "{layer} gets an equal share of the budget");
+        assert_eq!(times.first().copied(), Some(0), "{layer} starts at 0 ms");
+        assert_eq!(times.last().copied(), Some(120_000), "{layer} ends at its declared span");
+    }
+    let codes: Vec<&str> = v["limitations"].as_array().into_iter().flatten().filter_map(|l| l["code"].as_str()).collect();
+    assert!(codes.contains(&"envelope_resampled"), "{codes:?}");
+}
+
+#[test]
+fn offline_render_fits_ten_sixty_second_envelopes() {
+    // 10 layers × 60 s at the 100 ms target is 6010 readings: also over the budget, also legal.
+    let (url, _) = fake_cdp_with_eval(offline_report());
+    let e = Engine::new(crate::testing::session());
+    let layers: Vec<Value> = (0..10)
+        .map(|index| {
+            json!({
+                "id": format!("layer_{index}"),
+                "kind": "oscillator",
+                "wave": "sine",
+                "envelope": [
+                    {"t_ms": 0, "gain": 0.0, "pan": 0.0},
+                    {"t_ms": 60_000, "gain": 0.5, "pan": 0.0}
+                ]
+            })
+        })
+        .collect();
+    let v = offline_call(&e, json!({"cdp_endpoint": url, "recipe": {"version": 1, "layers": layers}, "duration_ms": 60_000})).unwrap();
+    let envelope = v["result"]["fingerprint"]["mixer_envelope"].as_array().cloned().unwrap_or_default();
+    assert_eq!(envelope.len(), 6000, "{}", envelope.len());
+}
+
+#[test]
+fn offline_envelope_grid_records_the_spacing_the_curve_uses() {
+    // The even spacing is last / (points - 1), so a 350 ms envelope has 5 points 87.5 ms apart;
+    // the recorded times are those positions rounded to the nearest millisecond.
+    let (url, _) = fake_cdp_with_eval(offline_report());
+    let e = Engine::new(crate::testing::session());
+    let recipe = json!({
+        "version": 1,
+        "layers": [{
+            "id": "pad",
+            "kind": "oscillator",
+            "wave": "sine",
+            "envelope": [
+                {"t_ms": 0, "gain": 0.0, "pan": 0.0},
+                {"t_ms": 350, "gain": 1.0, "pan": 0.0}
+            ]
+        }]
+    });
+    let v = offline_call(&e, json!({"cdp_endpoint": url, "recipe": recipe, "duration_ms": 3000})).unwrap();
+    let envelope = v["result"]["fingerprint"]["mixer_envelope"].as_array().cloned().unwrap_or_default();
+    let times: Vec<u64> = envelope.iter().filter_map(|point| point["t_ms"].as_u64()).collect();
+    assert_eq!(times, vec![0, 88, 175, 263, 350], "{}", v["result"]);
+    let gain_at_88 = envelope[1]["gain"].as_f64().unwrap_or(f64::NAN);
+    assert!((gain_at_88 - 88.0 / 350.0).abs() < 1e-4, "{gain_at_88}");
+}
+
+#[test]
+fn offline_render_refuses_envelope_points_past_the_render_end() {
+    let e = Engine::new(crate::testing::session());
+    let err = offline_call(
+        &e,
+        json!({
+            "cdp_endpoint": "http://127.0.0.1:9",
+            "recipe": {"version": 1, "layers": [{
+                "id": "pad",
+                "kind": "oscillator",
+                "envelope": [
+                    {"t_ms": 0, "gain": 0.0, "pan": 0.0},
+                    {"t_ms": 5000, "gain": 1.0, "pan": 0.0}
+                ]
+            }]},
+            "duration_ms": 1000
+        }),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadInput, "{}", err.message);
+    assert!(err.message.contains("5000") && err.message.contains("1000"), "{}", err.message);
+}
+
+#[test]
+fn offline_render_refuses_a_single_point_or_oversized_envelope() {
+    let e = Engine::new(crate::testing::session());
+    for (envelope, expected) in [
+        (json!([{"t_ms": 0, "gain": 0.0, "pan": 0.0}]), ErrorCode::BadInput),
+        (json!((0..super::MAX_OFFLINE_ENVELOPE + 1).map(|i| json!({"t_ms": i, "gain": 0.5, "pan": 0.0})).collect::<Vec<_>>()), ErrorCode::OverLimit),
+        (json!([{"t_ms": 1000, "gain": 0.0, "pan": 0.0}, {"t_ms": 0, "gain": 1.0, "pan": 0.0}]), ErrorCode::BadInput),
+    ] {
+        let err = offline_call(
+            &e,
+            json!({
+                "cdp_endpoint": "http://127.0.0.1:9",
+                "recipe": {"version": 1, "layers": [{"id": "pad", "kind": "oscillator", "envelope": envelope}]},
+                "duration_ms": 1000
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, expected, "{}", err.message);
+    }
+}
+
+#[test]
+fn offline_render_refuses_recipes_outside_its_bounds_before_touching_a_browser() {
+    let e = Engine::new(crate::testing::session());
+    let layers = vec![json!({"kind": "oscillator", "wave": "sine"}); 257];
+    for (params, expected) in [
+        (json!({"recipe": {"version": 1, "layers": []}, "duration_ms": 0}), ErrorCode::BadInput),
+        (json!({"recipe": {"version": 1, "layers": []}, "duration_ms": 120_001}), ErrorCode::BadInput),
+        (json!({"recipe": {"version": 2, "layers": []}, "duration_ms": 1000}), ErrorCode::BadInput),
+        (json!({"recipe": {"version": 1, "layers": layers}, "duration_ms": 1000}), ErrorCode::OverLimit),
+        (json!({"recipe": {"version": 1, "layers": [{"kind": "oscillator", "wave": "meow"}]}, "duration_ms": 1000}), ErrorCode::BadInput),
+        (json!({"recipe": {"version": 1, "layers": []}, "duration_ms": 120_000, "sample_rate": 96_000}), ErrorCode::OverLimit),
+    ] {
+        let mut params = params;
+        params["cdp_endpoint"] = json!("http://127.0.0.1:9");
+        let err = offline_call(&e, params.clone()).unwrap_err();
+        assert_eq!(err.code, expected, "{params}: {}", err.message);
+    }
 }
