@@ -369,17 +369,32 @@ class TestDoctor(Base):
     def test_doctor_reports_every_missing_gate(self):
         r = self.p.run("doctor")
         self.assertEqual(r.returncode, 1)
-        self.assertIn("Stop hook missing", r.stderr + r.stdout)
         self.assertIn("pre-push gate missing", r.stderr + r.stdout)
         self.assertIn("CI gate missing", r.stderr + r.stdout)
 
     def test_doctor_ok_when_gates_installed(self):
-        self.p.write(".claude/settings.json", '{"hooks": {"Stop": [{"hooks": [{"command": "state-check --struct --hook"}]}]}}')
         self.p.write(".githooks/pre-push", "#!/bin/sh\npython3 scripts/state-check --run\n", mode=0o755)
         self.p.write(".github/workflows/state.yml", "jobs:\n  state:\n    steps:\n      - run: python3 scripts/state-check --run\n")
         r = self.p.run("doctor")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("doctor ok", r.stdout)
+
+    def test_doctor_does_not_require_the_claude_stop_hook(self):
+        # The Stop hook fires only under Claude Code. A project driven by another
+        # harness must not be told its gate is missing when it never had one.
+        self.p.write(".githooks/pre-push", "#!/bin/sh\npython3 scripts/state-check --run\n", mode=0o755)
+        self.p.write(".github/workflows/state.yml", "jobs:\n  state:\n    steps:\n      - run: python3 scripts/state-check --run\n")
+        r = self.p.run("doctor")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("Stop hook", r.stdout + r.stderr)
+
+    def test_doctor_still_fails_on_a_legacy_stop_hook_alone(self):
+        # A Stop hook is not a substitute for the harness-neutral gates.
+        self.p.write(".claude/settings.json", '{"hooks": {"Stop": [{"hooks": [{"command": "state-check --struct --hook"}]}]}}')
+        r = self.p.run("doctor")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("pre-push gate missing", r.stderr + r.stdout)
+        self.assertIn("CI gate missing", r.stderr + r.stdout)
 
 
 class TestHook(Base):

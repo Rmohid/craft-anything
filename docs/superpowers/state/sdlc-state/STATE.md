@@ -53,7 +53,7 @@ beads: off
 - [x] S04 Vendor state-check and its tests | kind: build | req: R1 | est: 15m
   - check: `cmp -s scripts/state-check "$HOME/.agents/skills/sdlc-state/scripts/state-check"; echo $?`
   - expect: `0`
-  - evidence: b5fd1030 · 2026-11-15 01:16 · exit 0 · "exit 0 (cmp identical at ~/.agents)"
+  - evidence: 1ed0e67a · 2026-11-15 01:35 · exit 0 · "exit 0 (cmp identical at ~/.agents)"
 - [x] S05 Write the plan | kind: plan | req: - | est: 20m
   - check: `test -f docs/superpowers/plans/2026-11-15-sdlc-state.md; echo $?`
   - expect: `0`
