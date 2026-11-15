@@ -6,10 +6,6 @@ plan: docs/superpowers/plans/2026-11-15-sdlc-state.md
 ledger: docs/superpowers/state/sdlc-state/progress.md
 test_cmd: python3 -m pytest {path} -q -k {name}
 beads: off
-<!-- Receipt inventory (parsed by receipt-validate, not by state-check):
-     expected items: R1, R2, R3, R4
-     outputs: scripts/state-check, scripts/tests/test_state_check.py, docs/superpowers/state/sdlc-state/STATE.md, docs/superpowers/plans/2026-11-15-sdlc-state.md
--->
 
 <!-- Edited only by the controller session. Never renumber or delete a step: a
      weeks-later session resumes by ID. Never record TDD sub-steps, chat
