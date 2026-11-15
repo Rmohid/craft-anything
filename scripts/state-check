@@ -223,6 +223,16 @@ def struct(st, root, final):
                         f"{rid}: wire step {wid} must not contain `--run` — "
                         "it recurses; the wire check calls `--struct`"
                     )
+        # Recursion guard for every wire step, internal rows included: a wire
+        # check that re-invokes the gate hangs the gate rather than failing it.
+        if row["w"]:
+            wstep = st["steps"].get(row["w"])
+            if wstep and wstep["kind"] == "wire" and "--run" in wstep["check"]:
+                if row["consumer"].lower() == "internal":
+                    errs.append(
+                        f"{rid}: wire step {row['w']} must not contain `--run` — "
+                        "it recurses; the wire check calls `--struct`"
+                    )
         if final and status != "covered":
             errs.append(f"{rid}: status `{status}` at final (must be covered)")
 
@@ -332,9 +342,11 @@ def run(st, root):
 
     # S-steps are the state machine; evidence strings are self-attested prose
     # until the check is re-executed. Re-run every done step and hold it to its
-    # declared expect. A check that invokes the gate itself (e.g. S13's
-    # `state-check --run --final`) is the gate's own receipt, not evidence to
-    # re-run — executing it would recurse without bound.
+    # declared expect. A check that invokes the gate itself (S06/S10/S13's
+    # `state-check ...`) is the gate's own receipt, not evidence to re-run in
+    # the S-loop — executing it would recurse without bound. Wire steps still
+    # re-run via the wire loop below; finish/review steps that invoke the gate
+    # remain self-attested by construction (the outer --run --final IS them).
     for sid in st["order"]:
         step = st["steps"][sid]
         if step["mark"] != "x":
