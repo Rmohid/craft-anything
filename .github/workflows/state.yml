@@ -1,0 +1,24 @@
+name: state
+
+# Re-execute the sdlc-state evidence gate on every pull request. The Stop and
+# pre-push hooks are local and disappear on a fresh clone; this job is the
+# backstop that cannot be uninstalled by the agent.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  state:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the checker's test runner
+        run: python3 -m pip install pytest
+      - name: The harness-neutral gates must still be installed
+        run: python3 scripts/state-check doctor
+      - name: Re-run every mapped test and wire check
+        run: python3 scripts/state-check --run --final

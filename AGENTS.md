@@ -100,6 +100,15 @@ These apply to every change by every agent and contributor, whether or not anyon
 - Read the code you'll touch and check STATUS.md and the roadmap for gaps it depends on. If you find new gaps or
   dependencies, add them to the roadmap rather than widening your change.
 
+### Multi-session work
+- Work that spans more than one session or about three steps uses the personal `sdlc-state` skill:
+  state lives in `docs/superpowers/state/<topic>/STATE.md`, history in its `progress.md`, and the gate is
+  `python3 scripts/state-check --run --final` before the branch is finished. It never edits superpowers skills.
+- The skill is installed at `~/.agents/skills/sdlc-state` (opencode loads `~/.agents/skills`). The repo's
+  `scripts/state-check` is a byte-identical copy of that skill's `scripts/state-check`; change both in the
+  same commit and check them with `cmp`.
+- `docs/superpowers/README.md` is the index for specs, plans and state.
+
 ### Git workflow
 - Never commit to `main`. Branch from an up-to-date `main` with a standard prefix, then the roadmap id if
   there is one: `feature/`, `bugfix/`, `hotfix/` (urgent fix to released code), `refactor/`, `docs/`, `test/`

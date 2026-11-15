@@ -1005,7 +1005,7 @@ fn codex_login_status(success: bool, stdout: &str, stderr: &str) -> Option<bool>
 /// What a finished Codex tool call says. A failed call carries `"result": null` beside its
 /// `error`, which showed as "null" (#540), so null fields are skipped and an error's message is
 /// used as written. Codex's refusal to run one of our tools it can't ask about gets the way out.
-fn codex_tool_text(item: &Value, tool: &str, ours: bool) -> String {
+pub(crate) fn codex_tool_text(item: &Value, tool: &str, ours: bool) -> String {
     let field = |k: &str| item.get(k).filter(|v| !v.is_null());
     let error = field("error").map(|e| e.get("message").and_then(Value::as_str).map_or_else(|| e.to_string(), str::to_string));
     let text = match (field("result"), error) {
@@ -1015,9 +1015,16 @@ fn codex_tool_text(item: &Value, tool: &str, ours: bool) -> String {
     };
     // Another MCP server's refusal isn't fixed by our setup: it keeps Codex's own words.
     if ours && text.contains(CODEX_NEEDS_APPROVAL) {
-        // The feed keeps 200 characters of a result, so the fix comes first and fits.
+        // The feed keeps 200 characters of a result, so the fix comes first and fits. Setup
+        // approves only the tools that ask the person themselves; any other is approved, or not,
+        // in the person's own Codex settings, and setup changes nothing for it (#1867).
+        if craft_anything_engine::AGENT_APP_PREAPPROVED_TOOLS.contains(&tool) {
+            return format!(
+                "Codex blocked {tool}: it can't ask for approval here. Fix: run `craft-anything-cli setup --client codex --yes`, then retry. See docs/codex.md."
+            );
+        }
         return format!(
-            "Codex blocked {tool}: it can't ask for approval here. Fix: run `craft-anything-cli setup --client codex --yes`, then retry. See docs/codex.md."
+            "Codex blocked {tool}: it can't ask for approval here. To allow it, set approval_mode = \"approve\" under [mcp_servers.craft-anything.tools.{tool}] in Codex's config.toml."
         );
     }
     text

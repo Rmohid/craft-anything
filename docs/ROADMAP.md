@@ -962,6 +962,11 @@ Owner: open · Status: in progress
       build's model check woke it, and a session left from days before went on editing another
       project. Discover with a private server unless the person chose `--server`
       — claimed: youkaicountry, branch bugfix/r2.2-opencode-discovery-standalone
+- [x] OpenCode's private server can answer model discovery with 503 `ServiceUnavailableError`
+      ("Location plugins did not finish activating") while it starts, now and then, and the
+      question or build stops before it begins (#1859). Ask once more after a short pause when
+      that is what it said; a turn already retries OpenCode's 503s
+      — claimed: FuryNocturn, branch bugfix/r2.2-opencode-models-503
 - [x] `docs/opencode.md` says "OpenCode V2" but not where to get it: OpenCode's install script
       and npm's `opencode-ai` give the 1.x line, whose `run` has no `--standalone` (npm's
       `@opencode/cli` is 2.x), so the check before a build
@@ -1019,6 +1024,11 @@ Owner: open · Status: in progress
       `null`; setup and the builder now approve our tools for Codex (we still ask before running
       code) and a refusal explains the fix (`docs/codex.md`)
 - [ ] Codex (#540): run `codex exec` on a real install and check `rebuild_start` gets through
+- [x] Codex (#1867): a refusal of one of our tools that setup doesn't approve (`build_command_run`)
+  tells the person to run `setup --client codex`, which changes nothing for it. Say how to
+  approve that tool in Codex's own `config.toml` instead, and keep the setup hint for the tools
+  setup approves (`AGENT_APP_PREAPPROVED_TOOLS`)
+  — claimed: FuryNocturn, branch bugfix/r2.2-codex-blocked-tool-hint
 - [x] Codex: resume support (`codex exec resume <id>`), verified on a real install
       — claimed: Codex, branch feature/r2.2-codex-resume (local workspace)
       — verified on macOS with Codex 0.169.0-alpha.11.1: MCP call, sandboxed file write,

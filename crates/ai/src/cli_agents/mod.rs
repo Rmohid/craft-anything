@@ -1987,6 +1987,14 @@ mod tests {
         let events = adapter_for("codex").parse(&mut p, &v);
         let text = format!("{events:?}");
         assert!(text.contains("setup --client codex --yes"), "{text}");
+        // #1867: setup doesn't approve build_command_run, so the way out is Codex's own setting.
+        let mut p = StreamParser::new(adapter_for("codex"));
+        let other = line.replace("rebuild_start", "build_command_run");
+        let events = adapter_for("codex").parse(&mut p, &serde_json::from_str::<Value>(&other).unwrap());
+        let text = format!("{events:?}");
+        assert!(text.contains("[mcp_servers.craft-anything.tools.build_command_run]") && !text.contains("setup --client codex"), "{text}");
+        let hint = adapters::codex_tool_text(&serde_json::from_str::<Value>(&other).unwrap()["item"], "build_command_run", true);
+        assert!(hint.len() <= 200, "the feed keeps 200 characters: {} in {hint}", hint.len());
         // Another server's refusal keeps Codex's words: our setup can't fix it.
         let mut p = StreamParser::new(adapter_for("codex"));
         let theirs = line.replace("craft-anything", "other-server");

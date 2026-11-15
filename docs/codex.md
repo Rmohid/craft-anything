@@ -50,6 +50,15 @@ Only tools that ask the person themselves are approved on Codex's side
 (`AGENT_APP_PREAPPROVED_TOOLS` in the engine, today just `rebuild_start`; a test checks each one
 asks for consent). Every other tool keeps whatever approval policy you set in Codex.
 
+So when a build's feed says Codex blocked another of our tools, such as `build_command_run`,
+running setup again changes nothing for it (#1867). To let Codex call it during a build, approve
+it yourself in Codex's `config.toml`; setup keeps the setting:
+
+```toml
+[mcp_servers.craft-anything.tools.build_command_run]
+approval_mode = "approve"
+```
+
 - **Connecting Codex to Craft Anything** (`craft-anything-cli setup --client codex --yes`, or the
   Connect screen) writes the entry in `~/.codex/config.toml` (`$CODEX_HOME/config.toml` if set):
 
