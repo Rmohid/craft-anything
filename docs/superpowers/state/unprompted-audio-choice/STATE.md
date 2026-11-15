@@ -14,9 +14,9 @@ beads: off
 
 ## Resume
 
-- next: S13 (finish: run the gate, then this branch is done — local only, no PR)
-- last-green: 68363266
-- in-flight: nothing
+- next: none
+- last-green: 24f7e707
+- in-flight: none; S01-S13 done and `--run --final` green
 - blockers: none
 - do-not: the smoke test's negative result is real. Do not rebuild `core_tool_search` or a
   capability index without a page whose sound can be captured but not read. The Kimi OpenRouter
