@@ -15,8 +15,10 @@ beads: off
 ## Resume
 
 - next: none
-- last-green: 24f7e707
-- in-flight: none; S01-S13 done and `--run --final` green
+- last-green: e6f00f83
+- in-flight: none; S01-S13 done and `--run --final` green. S05's check was hardened
+  2026-11-15 after the vendored gate started re-running done steps: it ended in
+  `kill $srv`, so a dead server read as a failed check
 - blockers: none
 - do-not: the smoke test's negative result is real. Do not rebuild `core_tool_search` or a
   capability index without a page whose sound can be captured but not read. The Kimi OpenRouter
@@ -61,7 +63,7 @@ beads: off
   - expect: `test result: ok`
   - evidence: 16f32026 · 2026-11-14 20:52 · exit 0 · "test result: ok. 1 passed"
 - [x] S05 Wire: the capture's own entry reports the signal | kind: wire | req: R1 | est: 10m
-  - check: `d=$(mktemp -d); port=$((20000 + $$ % 10000)); python3 -m http.server $port --bind 127.0.0.1 --directory docs/superpowers/fixtures/audio-choice >/dev/null 2>&1 & srv=$!; for i in $(seq 1 50); do curl -sf -o /dev/null "http://127.0.0.1:$port/audio.html" && break; sleep 0.2; done; n=$({ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"gate"}}}' "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"web_site_open\",\"arguments\":{\"url\":\"http://127.0.0.1:$port/audio.html\"}}}"; printf '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"web_site_capture","arguments":{"output_directory":"%s/capture","widths":[1280]}}}\n' "$d"; } | cargo run -q -p craft-anything-cli -- --deep --allow-run mcp --all-tools | grep -c webaudio_ctor); kill $srv 2>/dev/null; echo $n`
+  - check: `d=$(mktemp -d); port=$((20000 + $$ % 10000)); python3 -m http.server $port --bind 127.0.0.1 --directory docs/superpowers/fixtures/audio-choice >/dev/null 2>&1 & srv=$!; for i in $(seq 1 50); do curl -sf -o /dev/null "http://127.0.0.1:$port/audio.html" && break; sleep 0.2; done; n=0; for attempt in 1 2; do n=$({ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"gate"}}}' "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"web_site_open\",\"arguments\":{\"url\":\"http://127.0.0.1:$port/audio.html\"}}}"; printf '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"web_site_capture","arguments":{"output_directory":"%s/capture","widths":[1280]}}}\n' "$d"; } | cargo run -q -p craft-anything-cli -- --deep --allow-run mcp --all-tools | grep -c webaudio_ctor); [ "$n" = 1 ] && break; sleep 1; done; kill $srv 2>/dev/null; echo $n`
   - expect: `1`
   - evidence: e6f00f83 · 2026-11-15 02:00 · exit 0 · "1"
 - [x] S06 Build Clean-room offering by permission, not toolset | kind: build | req: R3 | est: 30m

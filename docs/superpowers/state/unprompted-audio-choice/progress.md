@@ -16,3 +16,5 @@
 | 2026-11-14 | DONE | S12 docs routed (STATUS, ROADMAP) |
 | 2026-11-15 | FINAL-GREEN | 68363266 · state-check --run --final ok (2 state files) |
 | 2026-11-15 | FINAL-GREEN | 24f7e707 · state-check --run --final ok (2 state files) |
+| 2026-11-15 | RULING | S05's check hardened, not replaced: the old one ended in `kill $srv`, so the exit code was kill's, and it raced a fixed port with `sleep 1`. Same step id, same expect `1`; now an ephemeral port, a readiness poll, `echo $n` last, and two capture attempts, because a long-lived browser on the machine makes one launch fail now and then. |
+| 2026-11-15 | FINAL-GREEN | e6f00f83 · state-check --run --final ok (2 state files); pre-push hook green twice after the fix |
