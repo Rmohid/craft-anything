@@ -354,6 +354,12 @@ def run(st, root):
         cmd = tick(step["check"])
         if cmd == "true" or "scripts/state-check" in cmd:
             continue
+        # Wire steps re-run below via the wire loop; running them here too
+        # would execute stateful checks (e.g. a localhost server) twice.
+        # (The localhost-server check is itself racy: its trailing `kill` can
+        # exit nonzero when the server exited first — see audio S05.)
+        if step["kind"] == "wire":
+            continue
         code, out = shell(cmd, root)
         if code != 0:
             errs.append(
