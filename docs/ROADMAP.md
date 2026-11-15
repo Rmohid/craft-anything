@@ -2805,10 +2805,12 @@ Owner: open · Status: in progress
       summaries for the four audio tools; and Clean room offering `clean_room::TOOLS ∩ registry` so
       the Clean-room-allowed fingerprint/compare are reachable there at all.
       — claimed: opencode-agent, branch `feature/r3.13-unprompted-audio-choice`
-- [ ] Prove unprompted choice with the two-arm eval (control vs patched, N≥5 each, bar: an audio
-      tool within 4 turns after the first `web_site_capture` result). Gated: it spends the app's
-      model keys rather than the batch budget, so it runs only on a sized estimate and an explicit
-      go-ahead. `core_target_triage` gains `audio_evidence` when it holds a file inventory to read.
+- [ ] Prove unprompted choice with a two-run smoke test (one control, one patched; pass: an audio
+      tool within 4 turns after the first `web_site_capture` result in the patched run and not in
+      the control). Gated: it spends the app's model keys rather than the batch budget, so it runs
+      only on a sized estimate and an explicit go-ahead. A pass rate is a later question, asked
+      when something depends on it. `core_target_triage` gains `audio_evidence` when it holds a
+      file inventory to read.
 - [ ] Live-proof the attached Endel capture end to end: 30 s from the signed-in ego browser
       while Focus plays — graph, spectrum, mixer snapshot, nothing secret in the evidence
       (`web_audio_offline_render`, fingerprint and compare already prove live).
