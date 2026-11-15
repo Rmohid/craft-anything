@@ -15,7 +15,7 @@ beads: off
 ## Resume
 
 - next: none
-- last-green: f56f45ef
+- last-green: 39f3e232
 - in-flight: none; S01-S13 done and `--run --final` green
 - blockers: none
 - do-not: never put `--run` in a wire check; it recurses. The wire check calls `--struct`.
